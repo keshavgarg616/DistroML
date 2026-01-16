@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
-from common import JobState, WorkerStatus
+from ..common import JobState, WorkerStatus
 
 class WorkerResources(BaseModel):
     cpu_count: int = Field(default=2, ge=1, description="Number of CPU cores")

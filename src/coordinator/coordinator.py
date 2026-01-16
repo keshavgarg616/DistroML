@@ -16,7 +16,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from statemachine import StateMachine, State
 
-from coordinator.models import (
+from .models import (
     WorkerResources,
     JobInfo,
     JobSpec,
@@ -25,7 +25,7 @@ from coordinator.models import (
     HeartbeatPayload,
     JobStatusResponse,
 )
-from common import (
+from ..common import (
     JobState,
     WorkerStatus,
     HEARTBEAT_TIMEOUT_SECONDS,
