@@ -5,6 +5,9 @@
 
 ---
 
+MVP scope: single-machine multi-process CPU training (2–4 workers), PyTorch-only, data-parallel AllReduce, manifest checkpoints + recovery, WebSocket metrics/logs, basic React dashboard.
+
+
 ## 1. Purpose
 
 DistroML is a distributed machine learning training framework focused on:
