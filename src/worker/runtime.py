@@ -105,6 +105,8 @@ class WorkerRuntime:
             "world_size": self.config.world_size,
             "job_id": self.config.job_id,
             "run_id": self.config.run_id,
+            "host": self.hostname,
+            "port": int(os.environ.get("MASTER_PORT", "29500")),
             "hostname": self.hostname,
             "pid": self.pid,
             "backend": self.config.backend,
