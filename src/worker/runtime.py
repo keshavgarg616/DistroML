@@ -400,6 +400,7 @@ def main():
             return 1
 
         # Run training
+        dist.barrier()
         worker.training_loop(total_steps=args.total_steps)
 
     except KeyboardInterrupt:
