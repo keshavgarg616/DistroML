@@ -14,8 +14,11 @@ from enum import Enum
 import json
 
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import torch.distributed as dist
 import requests
+from time import perf_counter
 
 
 # Configure logging
@@ -60,6 +63,7 @@ class WorkerMetrics:
     step: int
     epoch: int
     loss: float
+    step_time: float  # seconds per step
     throughput: float  # samples/sec
     timestamp: float
 
@@ -236,11 +240,63 @@ class WorkerRuntime:
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to emit metrics: {e}")
 
+    def sync_gradients(self, model: nn.Module):
+        """
+        Placeholder for gradient synchronization across workers.
+        This will be implemented with either DDP or manual AllReduce.
+
+        Args:
+            model: The neural network model with gradients to sync
+        """
+        # TO BE IMPLEMENTED
+        pass
+
+    def train_step(
+        self,
+        model: nn.Module,
+        batch: tuple,
+        criterion: nn.Module,
+        optimizer: optim.Optimizer,
+    ) -> tuple[float, float]:
+        """
+        Execute one training step: forward → loss → backward → sync → optimizer step.
+
+        Args:
+            model: Neural network model
+            batch: Tuple of (inputs, targets)
+            criterion: Loss function
+            optimizer: Optimizer (e.g., SGD, Adam)
+
+        Returns:
+            tuple: (loss_value, step_time) where step_time is in seconds
+        """
+        step_start = perf_counter()
+
+        inputs, targets = batch
+
+        outputs = model(inputs)
+
+        loss = criterion(outputs, targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient synchronization (placeholder)
+        self.sync_gradients(model)
+
+        optimizer.step()
+
+        step_time = perf_counter() - step_start
+
+        return loss.item(), step_time
+
     def train_step_stub(self, step: int) -> WorkerMetrics:
         """
         Stubbed training step for MVP testing.
-        In production, this would call the framework adapter.
+        In production, this would call train_step() with real model/data.
         """
+        step_start = perf_counter()
+
         # Simulate some work
         time.sleep(0.1)
 
@@ -248,6 +304,9 @@ class WorkerRuntime:
         if self.dist_initialized:
             dummy_tensor = torch.randn(100)
             dist.all_reduce(dummy_tensor, op=dist.ReduceOp.SUM)
+
+        # Calculate step time
+        step_time = perf_counter() - step_start
 
         # Generate fake metrics
         fake_loss = 2.5 - (step * 0.001)  # Decreasing loss
@@ -257,6 +316,7 @@ class WorkerRuntime:
             step=step,
             epoch=self.current_epoch,
             loss=max(0.1, fake_loss),
+            step_time=step_time,
             throughput=fake_throughput,
             timestamp=time.time(),
         )
@@ -292,6 +352,7 @@ class WorkerRuntime:
                         f"Step {step}/{total_steps} | "
                         f"Epoch {self.current_epoch} | "
                         f"Loss: {metrics.loss:.4f} | "
+                        f"Step time: {metrics.step_time:.3f}s | "
                         f"Throughput: {metrics.throughput:.1f} samples/s"
                     )
 
