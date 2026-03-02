@@ -11,10 +11,12 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List, Callable, Awaitable, Any
+from src.coordinator.manifest import build_manifest, save_manifest
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from statemachine import StateMachine, State
+import os
 
 from .models import (
     WorkerResources,
@@ -473,6 +475,7 @@ class Coordinator:
             check_interval_seconds=self.config.heartbeat_check_interval_seconds,
             on_worker_lost=self._on_worker_lost,
         )
+        self._checkpoint_reports = {}
 
         logger.info(f"Coordinator initialized with config: {self.config}")
 
@@ -812,3 +815,73 @@ class Coordinator:
 
     def __repr__(self) -> str:
         return f"Coordinator(jobs={len(self._jobs)}, config={self.config})"
+    
+    async def handle_checkpoint_complete(self, payload: dict) -> None:
+        """
+        Called when a worker reports checkpoint completion.
+        Aggregates worker shards and generates manifest
+        once all workers for a job + step have reported.
+        """
+
+        step = payload["step"]
+        run_id = payload["run_id"]
+        job_id = payload["job_id"]
+
+        key = (job_id, run_id, step)
+
+        if key not in self._checkpoint_reports:
+            self._checkpoint_reports[key] = []
+
+        self._checkpoint_reports[key].append(payload)
+
+        # Determine expected worker count from registry (source of truth)
+        workers = await self.worker_registry.get_workers_by_job(job_id)
+        expected_world_size = len(workers)
+
+        if len(self._checkpoint_reports[key]) == expected_world_size:
+            await self._generate_manifest(job_id, run_id, step, key)
+
+    async def _generate_manifest(
+        self,
+        job_id: str,
+        run_id: str,
+        step: int,
+        key: tuple
+    ) -> None:
+        """
+        Build and persist manifest.json for a completed checkpoint step.
+        """
+
+        worker_reports = self._checkpoint_reports.get(key, [])
+        world_size = len(worker_reports)
+
+        worker_shards = []
+        for report in worker_reports:
+            worker_shards.append({
+                "worker_id": report["worker_id"],
+                "rank": report["rank"],
+                "path": report["checkpoint_path"],
+                "file_size_bytes": report["file_size_bytes"],
+                "sha256": report["sha256"],
+            })
+
+        manifest = build_manifest(
+            step=step,
+            run_id=run_id,
+            job_id=job_id,
+            world_size=world_size,
+            worker_shards=worker_shards,
+        )
+
+        output_dir = os.path.join(
+            "checkpoints",
+            run_id,
+            f"ckpt_step_{step:06d}"
+        )
+
+        manifest_path = save_manifest(manifest, output_dir)
+
+        logger.info(f"Manifest generated: {manifest_path}")
+
+        # Clean up memory for this checkpoint
+        del self._checkpoint_reports[key]

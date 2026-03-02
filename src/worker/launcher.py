@@ -39,7 +39,8 @@ class WorkerLauncher:
         for rank in range(world_size):
             cmd = [
                 sys.executable,
-                "worker_runtime.py",
+                "-m",
+                "runtime",
                 "--rank",
                 str(rank),
                 "--world-size",
