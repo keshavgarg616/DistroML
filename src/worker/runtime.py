@@ -404,12 +404,22 @@ class WorkerRuntime:
         logger.info("Shutting down worker...")
         self.is_running = False
         self.stop_heartbeat()
+        self._notify_coordinator_exit()
 
         if self.dist_initialized:
             dist.destroy_process_group()
             logger.info("Distributed context destroyed")
 
         logger.info("Worker shutdown complete")
+
+    def _notify_coordinator_exit(self):
+        try:
+            url = f"{self.config.coordinator_url}/api/workers/deregister"
+            requests.post(url, json={"worker_id": self.config.worker_id}, timeout=3)
+        except Exception:
+            logger.warning(
+                f"Failed to notify coordinator of worker exit: {self.config.worker_id}"
+            )
 
 
 def main():

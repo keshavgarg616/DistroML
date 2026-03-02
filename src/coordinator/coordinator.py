@@ -1,6 +1,6 @@
 """
 - CoordinatorConfig: Configuration management
-- JobStateMachine: Job lifecycle state machine  
+- JobStateMachine: Job lifecycle state machine
 - WorkerRegistry: Thread-safe worker tracking
 - HeartbeatMonitor: Background heartbeat monitoring
 - Coordinator: Main orchestration hub
@@ -39,6 +39,7 @@ from ..common import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 class CoordinatorConfig(BaseSettings):
 
@@ -92,6 +93,7 @@ class CoordinatorConfig(BaseSettings):
             f"log_level={self.log_level})"
         )
 
+
 class JobStateMachine(StateMachine):
     """
     Job lifecycle state machine.
@@ -128,13 +130,15 @@ class JobStateMachine(StateMachine):
         self,
         job_id: str,
         on_transition: Optional[Callable[[str, str, str], None]] = None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.job_id = job_id
         self._on_transition_callback = on_transition
 
-    def on_transition(self, event: str, source: State, target: State, **kwargs: Any) -> None:
+    def on_transition(
+        self, event: str, source: State, target: State, **kwargs: Any
+    ) -> None:
         """Called on any state transition."""
         logger.info(
             f"Job {self.job_id} state transition: {source.value} → {target.value} (event: {event})"
@@ -146,7 +150,7 @@ class JobStateMachine(StateMachine):
             except Exception as e:
                 logger.error(
                     f"Error in state transition callback for job {self.job_id}: {e}",
-                    exc_info=True
+                    exc_info=True,
                 )
 
     def on_enter_running(self) -> None:
@@ -187,8 +191,7 @@ class JobStateMachine(StateMachine):
         """Attempt a state transition, returning success status."""
         if not self.can_transition(event_name):
             raise InvalidStateTransitionError(
-                from_state=self.current_state.value,
-                to_state=event_name
+                from_state=self.current_state.value, to_state=event_name
             )
 
         try:
@@ -198,7 +201,7 @@ class JobStateMachine(StateMachine):
         except Exception as e:
             logger.error(
                 f"Failed to execute transition {event_name} for job {self.job_id}: {e}",
-                exc_info=True
+                exc_info=True,
             )
             return False
 
@@ -207,7 +210,9 @@ class JobStateMachine(StateMachine):
         return self.current_state in [self.completed, self.failed, self.cancelled]
 
     def __repr__(self) -> str:
-        return f"JobStateMachine(job_id={self.job_id}, state={self.current_state.value})"
+        return (
+            f"JobStateMachine(job_id={self.job_id}, state={self.current_state.value})"
+        )
 
 
 class WorkerRegistry:
@@ -247,7 +252,9 @@ class WorkerRegistry:
             )
             del self._workers[worker_id]
 
-    async def update_heartbeat(self, worker_id: str, metrics: Optional[Dict[str, float]] = None) -> None:
+    async def update_heartbeat(
+        self, worker_id: str, metrics: Optional[Dict[str, float]] = None
+    ) -> None:
         async with self._lock:
             if worker_id not in self._workers:
                 raise WorkerNotFoundError(worker_id)
@@ -267,9 +274,7 @@ class WorkerRegistry:
             return self._workers.get(worker_id)
 
     async def list_workers(
-        self,
-        job_id: Optional[str] = None,
-        status: Optional[WorkerStatus] = None
+        self, job_id: Optional[str] = None, status: Optional[WorkerStatus] = None
     ) -> List[WorkerInfo]:
         async with self._lock:
             workers = list(self._workers.values())
@@ -305,8 +310,10 @@ class WorkerRegistry:
             threshold = now - timedelta(seconds=timeout_seconds)
 
             stale_workers = [
-                worker for worker in self._workers.values()
-                if worker.last_heartbeat < threshold and worker.status != WorkerStatus.LOST
+                worker
+                for worker in self._workers.values()
+                if worker.last_heartbeat < threshold
+                and worker.status != WorkerStatus.LOST
             ]
 
             if stale_workers:
@@ -318,9 +325,7 @@ class WorkerRegistry:
             return stale_workers
 
     async def count_workers(
-        self,
-        job_id: Optional[str] = None,
-        status: Optional[WorkerStatus] = None
+        self, job_id: Optional[str] = None, status: Optional[WorkerStatus] = None
     ) -> int:
         workers = await self.list_workers(job_id=job_id, status=status)
         return len(workers)
@@ -337,6 +342,7 @@ class WorkerRegistry:
 
     def __repr__(self) -> str:
         return f"WorkerRegistry(workers={len(self._workers)})"
+
 
 class HeartbeatMonitor:
 
@@ -392,10 +398,7 @@ class HeartbeatMonitor:
             try:
                 await self._check_heartbeats()
             except Exception as e:
-                logger.error(
-                    f"Error in heartbeat check loop: {e}",
-                    exc_info=True
-                )
+                logger.error(f"Error in heartbeat check loop: {e}", exc_info=True)
 
             try:
                 await asyncio.sleep(self.check_interval_seconds)
@@ -413,9 +416,7 @@ class HeartbeatMonitor:
         if not stale_workers:
             return
 
-        logger.warning(
-            f"Detected {len(stale_workers)} workers with stale heartbeats"
-        )
+        logger.warning(f"Detected {len(stale_workers)} workers with stale heartbeats")
 
         for worker in stale_workers:
             await self._handle_timeout(worker)
@@ -432,8 +433,7 @@ class HeartbeatMonitor:
             await self.worker_registry.mark_worker_lost(worker_id)
         except Exception as e:
             logger.error(
-                f"Failed to mark worker {worker_id} as lost: {e}",
-                exc_info=True
+                f"Failed to mark worker {worker_id} as lost: {e}", exc_info=True
             )
 
         if self._on_worker_lost:
@@ -442,7 +442,7 @@ class HeartbeatMonitor:
             except Exception as e:
                 logger.error(
                     f"Error in on_worker_lost callback for {worker_id}: {e}",
-                    exc_info=True
+                    exc_info=True,
                 )
 
     def is_running(self) -> bool:
@@ -455,6 +455,7 @@ class HeartbeatMonitor:
             f"check_interval={self.check_interval_seconds}s, "
             f"running={self._running})"
         )
+
 
 class Coordinator:
 
@@ -491,7 +492,7 @@ class Coordinator:
                 f"Total workers: {await self.worker_registry.count_workers()}"
             )
 
-    async def submit_job(self, job_spec: JobSpec) -> str:        
+    async def submit_job(self, job_spec: JobSpec) -> str:
         job_id = str(uuid.uuid4())
 
         job_info = JobInfo(
@@ -637,6 +638,17 @@ class Coordinator:
 
         logger.debug(f"Heartbeat received from worker {heartbeat.worker_id}")
 
+    async def handle_worker_exit(self, worker_id: str) -> None:
+        """Called when a worker explicitly notifies the coordinator it is exiting."""
+        worker = await self.worker_registry.get_worker(worker_id)
+        if not worker:
+            raise WorkerNotFoundError(worker_id)
+
+        job_id = worker.job_id
+        await self.worker_registry.mark_worker_lost(worker_id)
+        logger.warning(f"Worker {worker_id} reported exit (job: {job_id})")
+        await self._trigger_recovery(job_id, worker_id)
+
     async def _on_worker_lost(self, worker_id: str) -> None:
         logger.error(f"Worker lost detected: {worker_id}")
 
@@ -748,7 +760,9 @@ class Coordinator:
 
             if len(alive_workers) == 0:
                 # All workers died during recovery
-                logger.error(f"All workers lost during recovery for job {job_id}. Failing.")
+                logger.error(
+                    f"All workers lost during recovery for job {job_id}. Failing."
+                )
                 state_machine.fail()
                 job_info.status = JobState.FAILED
                 job_info.error_message = "All workers lost during recovery"
@@ -757,8 +771,12 @@ class Coordinator:
 
             # Check recovery timeout (max_attempts * backoff = total time limit)
             recovery_started = job_info.recovery_started_at or job_info.updated_at
-            recovery_duration = (datetime.now(timezone.utc) - recovery_started).total_seconds()
-            max_recovery_time = self.config.max_recovery_attempts * self.config.recovery_backoff_seconds
+            recovery_duration = (
+                datetime.now(timezone.utc) - recovery_started
+            ).total_seconds()
+            max_recovery_time = (
+                self.config.max_recovery_attempts * self.config.recovery_backoff_seconds
+            )
 
             if recovery_duration > max_recovery_time:
                 logger.error(
@@ -787,7 +805,9 @@ class Coordinator:
                 job_info.error_message = f"Resume failed: {e}"
                 job_info.completed_at = datetime.now(timezone.utc)
 
-    def _on_job_state_transition(self, job_id: str, from_state: str, to_state: str) -> None:
+    def _on_job_state_transition(
+        self, job_id: str, from_state: str, to_state: str
+    ) -> None:
         logger.info(f"Job {job_id} state transition: {from_state} → {to_state}")
 
     def __repr__(self) -> str:
