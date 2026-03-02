@@ -17,6 +17,9 @@ import torch
 import torch.distributed as dist
 import requests
 
+import hashlib
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -264,7 +267,7 @@ class WorkerRuntime:
         )
 
         return metrics
-
+        
     def training_loop(self, total_steps: int = 100, steps_per_epoch: int = 50):
         """
         Main training loop (stubbed for MVP).
@@ -309,6 +312,13 @@ class WorkerRuntime:
             logger.error(f"Training loop failed: {e}")
             self.state = WorkerState.FAILED
             raise
+    
+    def _compute_sha256(self, file_path: str) -> str:
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
 
     def _save_checkpoint_stub(self, step: int):
         """
@@ -339,6 +349,30 @@ class WorkerRuntime:
 
         logger.info(f"Checkpoint saved: {checkpoint_path}")
         self.state = WorkerState.TRAINING
+        # ---- NEW: Compute file metadata ----
+        file_size = os.path.getsize(checkpoint_path)
+        file_hash = self._compute_sha256(checkpoint_path)
+
+        checkpoint_payload = {
+            "worker_id": self.config.worker_id,
+            "rank": self.config.rank,
+            "step": step,
+            "run_id": self.config.run_id,
+            "job_id": self.config.job_id,
+            "checkpoint_path": checkpoint_path,
+            "file_size_bytes": file_size,
+            "sha256": file_hash,
+            "world_size": self.config.world_size,
+        }
+
+        try:
+            requests.post(
+                f"{self.config.coordinator_url}/api/jobs/{self.config.job_id}/checkpoint-complete",
+                json=checkpoint_payload,
+                timeout=5,
+            )
+        except Exception as e:
+            logger.error(f"Failed to report checkpoint completion: {e}")
 
     def shutdown(self):
         """Clean shutdown of worker"""
