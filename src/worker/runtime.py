@@ -4,6 +4,8 @@ Implements worker registration, heartbeat emission, and stubbed training loop.
 """
 
 import os
+import sys
+import random
 import time
 import socket
 import logging
@@ -95,10 +97,38 @@ class WorkerRuntime:
         # Distributed context
         self.dist_initialized = False
 
+        # Failure injection config
+        self.kill_at_step = None
+        self.pause_at_step = None
+        self.pause_duration = 0
+        self.drop_heartbeat_rate = 0.0
+
+        # Initialize dummy model/optimizer for checkpointing
+        self.model = torch.nn.Linear(10, 1)
+        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+
         logger.info(
             f"Worker initialized: id={config.worker_id}, "
             f"rank={config.rank}/{config.world_size}, "
             f"backend={config.backend}"
+        )
+
+    def configure_failure_injection(
+        self,
+        kill_at_step: Optional[int] = None,
+        pause_at_step: Optional[int] = None,
+        pause_duration: int = 0,
+        drop_heartbeat_rate: float = 0.0,
+    ):
+        """Configure failure injection parameters"""
+        self.kill_at_step = kill_at_step
+        self.pause_at_step = pause_at_step
+        self.pause_duration = pause_duration
+        self.drop_heartbeat_rate = drop_heartbeat_rate
+        logger.info(
+            f"Failure injection configured: kill_at={kill_at_step}, "
+            f"pause_at={pause_at_step} ({pause_duration}s), "
+            f"drop_rate={drop_heartbeat_rate}"
         )
 
     def register(self) -> bool:
@@ -143,6 +173,11 @@ class WorkerRuntime:
 
     def _emit_heartbeat(self):
         """Send heartbeat to Coordinator"""
+        # Failure Injection: Drop Heartbeat
+        if self.drop_heartbeat_rate > 0 and random.random() < self.drop_heartbeat_rate:
+            logger.warning("💓 INJECTED FAILURE: Dropping heartbeat")
+            return
+
         heartbeat_data = {
             "worker_id": self.config.worker_id,
             "rank": self.config.rank,
@@ -339,6 +374,16 @@ class WorkerRuntime:
 
         try:
             for step in range(1, total_steps + 1):
+                # Failure Injection: Kill
+                if self.kill_at_step == step:
+                    logger.critical(f"💥 INJECTED FAILURE: Killing worker at step {step}")
+                    sys.exit(1)
+
+                # Failure Injection: Pause
+                if self.pause_at_step == step:
+                    logger.warning(f"⏸️ INJECTED FAILURE: Pausing worker for {self.pause_duration}s")
+                    time.sleep(self.pause_duration)
+
                 if not self.is_running:
                     logger.info("Training stopped by external signal")
                     break
@@ -364,7 +409,7 @@ class WorkerRuntime:
                 # Checkpoint logic (stubbed)
                 if step % 200 == 0:
                     logger.info(f"Checkpoint triggered at step {step}")
-                    self._save_checkpoint_stub(step)
+                    self.save_checkpoint(step)
 
             logger.info("Training loop completed successfully")
             self.state = WorkerState.STOPPED
@@ -381,10 +426,9 @@ class WorkerRuntime:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
-    def _save_checkpoint_stub(self, step: int):
+    def save_checkpoint(self, step: int):
         """
-        Stubbed checkpoint save.
-        In production, this would serialize model/optimizer state.
+        Save checkpoint with model, optimizer, and RNG state.
         """
         self.state = WorkerState.CHECKPOINTING
 
@@ -398,126 +442,18 @@ class WorkerRuntime:
 
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
-        # Write dummy checkpoint
-        checkpoint_data = {
+        # Save full state
+        state = {
             "step": step,
             "epoch": self.current_epoch,
             "rank": self.config.rank,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
 
-        with open(checkpoint_path, "w") as f:
-            json.dump(checkpoint_data, f)
+        torch.save(state, checkpoint_path)
 
         logger.info(f"Checkpoint saved: {checkpoint_path}")
         self.state = WorkerState.TRAINING
-        # ---- NEW: Compute file metadata ----
-        file_size = os.path.getsize(checkpoint_path)
-        file_hash = self._compute_sha256(checkpoint_path)
-
-        checkpoint_payload = {
-            "worker_id": self.config.worker_id,
-            "rank": self.config.rank,
-            "step": step,
-            "run_id": self.config.run_id,
-            "job_id": self.config.job_id,
-            "checkpoint_path": checkpoint_path,
-            "file_size_bytes": file_size,
-            "sha256": file_hash,
-            "world_size": self.config.world_size,
-        }
-
-        try:
-            requests.post(
-                f"{self.config.coordinator_url}/api/jobs/{self.config.job_id}/checkpoint-complete",
-                json=checkpoint_payload,
-                timeout=5,
-            )
-        except Exception as e:
-            logger.error(f"Failed to report checkpoint completion: {e}")
-
-    def shutdown(self):
-        """Clean shutdown of worker"""
-        logger.info("Shutting down worker...")
-        self.is_running = False
-        self.stop_heartbeat()
-        self._notify_coordinator_exit()
-
-        if self.dist_initialized:
-            dist.destroy_process_group()
-            logger.info("Distributed context destroyed")
-
-        logger.info("Worker shutdown complete")
-
-    def _notify_coordinator_exit(self):
-        try:
-            url = f"{self.config.coordinator_url}/api/workers/deregister"
-            requests.post(url, json={"worker_id": self.config.worker_id}, timeout=3)
-        except Exception:
-            logger.warning(
-                f"Failed to notify coordinator of worker exit: {self.config.worker_id}"
-            )
-
-
-def main():
-    """
-    Example worker launch.
-    In production, config would come from Coordinator via API or env vars.
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(description="DistroML Worker")
-    parser.add_argument("--rank", type=int, required=True)
-    parser.add_argument("--world-size", type=int, required=True)
-    parser.add_argument("--job-id", type=str, required=True)
-    parser.add_argument("--run-id", type=str, required=True)
-    parser.add_argument("--coordinator-url", type=str, default="http://localhost:8000")
-    parser.add_argument("--backend", type=str, default="gloo")
-    parser.add_argument("--total-steps", type=int, default=100)
-
-    args = parser.parse_args()
-
-    # Create worker config
-    config = WorkerConfig(
-        worker_id=f"worker_{args.rank}",
-        rank=args.rank,
-        world_size=args.world_size,
-        job_id=args.job_id,
-        run_id=args.run_id,
-        coordinator_url=args.coordinator_url,
-        backend=args.backend,
-    )
-
-    # Initialize worker
-    worker = WorkerRuntime(config)
-
-    try:
-        # Registration
-        if not worker.register():
-            logger.error("Registration failed, exiting")
-            return 1
-
-        # Start heartbeat
-        worker.start_heartbeat()
-
-        # Initialize distributed
-        if not worker.init_distributed():
-            logger.error("Distributed initialization failed, exiting")
-            return 1
-
-        # Run training
-        dist.barrier()
-        worker.training_loop(total_steps=args.total_steps)
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Worker failed: {e}")
-        return 1
-    finally:
-        worker.shutdown()
-
-    return 0
-
-
-if __name__ == "__main__":
-    exit(main())
