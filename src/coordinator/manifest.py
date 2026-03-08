@@ -46,3 +46,22 @@ def save_manifest(manifest: dict, output_dir: str):
     os.replace(tmp_path, manifest_path)
 
     return manifest_path
+
+
+def load_manifest(checkpoint_dir: str) -> dict:
+    manifest_path = os.path.join(checkpoint_dir, "manifest.json")
+
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    # Validate required fields
+    required_fields = ["step", "run_id", "job_id", "world_size", "worker_shards"]
+    missing_fields = [field for field in required_fields if field not in manifest]
+
+    if missing_fields:
+        raise ValueError(f"Manifest missing required fields: {missing_fields}")
+
+    return manifest

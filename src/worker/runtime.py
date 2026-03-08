@@ -363,17 +363,19 @@ class WorkerRuntime:
 
         return metrics
         
-    def training_loop(self, total_steps: int = 100, steps_per_epoch: int = 50):
-        """
-        Main training loop (stubbed for MVP).
-        Demonstrates step execution, metric emission, and checkpoint logic.
-        """
-        logger.info(f"Starting training loop: {total_steps} steps")
+    def training_loop(self, total_steps: int = 100, steps_per_epoch: int = 50, start_step: int = 0):
+    
+        if start_step > 0:
+            logger.info(f"Resuming training from step {start_step} to {total_steps}")
+        else:
+            logger.info(f"Starting training loop: {total_steps} steps")
+
         self.state = WorkerState.TRAINING
         self.is_running = True
 
         try:
-            for step in range(1, total_steps + 1):
+            # Start from start_step + 1 (next step to train) or 1 if fresh start
+            for step in range(max(1, start_step + 1), total_steps + 1):
                 # Failure Injection: Kill
                 if self.kill_at_step == step:
                     logger.critical(f"💥 INJECTED FAILURE: Killing worker at step {step}")
@@ -426,6 +428,101 @@ class WorkerRuntime:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
+    def find_latest_checkpoint(self) -> Optional[tuple]:
+        from src.coordinator.manifest import load_manifest
+
+        checkpoint_base = os.path.join(
+            self.config.checkpoint_dir,
+            f"{self.config.run_id}"
+        )
+
+        if not os.path.exists(checkpoint_base):
+            logger.info(f"No checkpoint directory found at {checkpoint_base}")
+            return None
+
+        checkpoint_dirs = []
+        for entry in os.listdir(checkpoint_base):
+            if entry.startswith("ckpt_step_"):
+                try:
+                    step_str = entry.replace("ckpt_step_", "")
+                    step = int(step_str)
+                    full_path = os.path.join(checkpoint_base, entry)
+                    checkpoint_dirs.append((step, full_path))
+                except ValueError:
+                    continue
+
+        if not checkpoint_dirs:
+            logger.info("No checkpoint directories found")
+            return None
+
+        checkpoint_dirs.sort(reverse=True, key=lambda x: x[0])
+
+        for step, checkpoint_dir in checkpoint_dirs:
+            try:
+                manifest = load_manifest(checkpoint_dir)
+                logger.info(f"Found valid checkpoint at step {step}")
+                return (checkpoint_dir, manifest)
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning(f"Checkpoint at step {step} has no valid manifest: {e}")
+                continue
+
+        logger.info("No valid checkpoints found (no manifests)")
+        return None
+
+    def restore_checkpoint(self, checkpoint_dir: str, manifest: dict) -> int:
+
+        if manifest["world_size"] != self.config.world_size:
+            raise ValueError(
+                f"Checkpoint world_size ({manifest['world_size']}) "
+                f"doesn't match current world_size ({self.config.world_size})"
+            )
+
+        worker_shard = None
+        for shard in manifest["worker_shards"]:
+            if shard["rank"] == self.config.rank:
+                worker_shard = shard
+                break
+
+        if worker_shard is None:
+            raise ValueError(
+                f"Rank {self.config.rank} not found in checkpoint manifest"
+            )
+
+        shard_path = worker_shard["path"]
+
+        if not os.path.exists(shard_path):
+            raise FileNotFoundError(f"Checkpoint shard not found: {shard_path}")
+
+        logger.info(f"Loading checkpoint from {shard_path}")
+        checkpoint = torch.load(shard_path, map_location="cpu")
+
+        if checkpoint["rank"] != self.config.rank:
+            raise ValueError(
+                f"Checkpoint rank ({checkpoint['rank']}) "
+                f"doesn't match worker rank ({self.config.rank})"
+            )
+
+        self.model.load_state_dict(checkpoint["model_state"])
+        logger.info("Model state restored")
+
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        logger.info("Optimizer state restored")
+
+        torch.set_rng_state(checkpoint["rng_state"])
+        if checkpoint.get("cuda_rng_state") and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+        logger.info("RNG state restored")
+
+        self.current_epoch = checkpoint["epoch"]
+        restored_step = checkpoint["step"]
+
+        logger.info(
+            f"Checkpoint restored successfully from step {restored_step}, "
+            f"epoch {self.current_epoch}"
+        )
+
+        return restored_step + 1
+
     def save_checkpoint(self, step: int):
         """
         Save checkpoint with model, optimizer, and RNG state.
@@ -457,3 +554,102 @@ class WorkerRuntime:
 
         logger.info(f"Checkpoint saved: {checkpoint_path}")
         self.state = WorkerState.TRAINING
+
+
+def main():
+    
+    import argparse
+    import uuid
+
+    parser = argparse.ArgumentParser(description="DistroML Worker Runtime")
+    parser.add_argument("--rank", type=int, required=True, help="Worker rank")
+    parser.add_argument("--world-size", type=int, required=True, help="Total number of workers")
+    parser.add_argument("--job-id", type=str, required=True, help="Job ID")
+    parser.add_argument("--run-id", type=str, required=True, help="Run ID")
+    parser.add_argument(
+        "--coordinator-url",
+        type=str,
+        default="http://localhost:8000",
+        help="Coordinator API URL",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="gloo",
+        choices=["gloo", "nccl"],
+        help="Distributed backend",
+    )
+    parser.add_argument("--total-steps", type=int, default=100, help="Total training steps")
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default="./checkpoints", help="Checkpoint directory"
+    )
+
+    args = parser.parse_args()
+
+    # Create worker configuration
+    worker_id = f"worker_{args.rank}_{uuid.uuid4().hex[:8]}"
+    config = WorkerConfig(
+        worker_id=worker_id,
+        rank=args.rank,
+        world_size=args.world_size,
+        coordinator_url=args.coordinator_url,
+        job_id=args.job_id,
+        run_id=args.run_id,
+        backend=args.backend,
+        checkpoint_dir=args.checkpoint_dir,
+    )
+
+    # Create and run worker
+    worker = WorkerRuntime(config)
+
+    try:
+        # Step 1: Register with coordinator
+        logger.info(f"Worker {args.rank} starting registration...")
+        worker.register()
+
+        # Step 2: Check for checkpoint and restore if found
+        start_step = 0
+        checkpoint_info = worker.find_latest_checkpoint()
+
+        if checkpoint_info:
+            checkpoint_dir, manifest = checkpoint_info
+            logger.info(f"Found checkpoint at step {manifest['step']}, restoring...")
+            start_step = worker.restore_checkpoint(checkpoint_dir, manifest)
+            logger.info(f"Restored from checkpoint, resuming from step {start_step}")
+        else:
+            logger.info("No checkpoint found, starting fresh")
+
+        # Step 3: Initialize distributed training
+        logger.info("Initializing distributed training...")
+        worker.init_distributed()
+
+        # Step 4: Synchronize all workers after restore (barrier)
+        if config.world_size > 1:
+            logger.info("Waiting for all workers to reach barrier...")
+            dist.barrier()
+            logger.info("All workers synchronized")
+
+        # Step 5: Start heartbeat thread
+        logger.info("Starting heartbeat thread...")
+        worker.start_heartbeat()
+
+        # Step 6: Run training loop
+        logger.info("Starting training...")
+        worker.training_loop(total_steps=args.total_steps, start_step=start_step)
+
+        logger.info("Worker completed successfully")
+
+    except Exception as e:
+        logger.error(f"Worker failed: {e}", exc_info=True)
+        worker.state = WorkerState.FAILED
+        sys.exit(1)
+
+    finally:
+        # Cleanup
+        worker.stop_heartbeat()
+        if worker.dist_initialized:
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
