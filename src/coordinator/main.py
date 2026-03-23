@@ -130,6 +130,9 @@ async def deregister_worker(payload: dict):
     tags=["Cluster"],
     summary="List active workers",
 )
+
+
+
 async def list_workers():
     return await coordinator.worker_registry.list_workers()
 

@@ -697,6 +697,39 @@ class Coordinator:
                 return
 
             job_info.status = JobState.RECOVERING
+
+            import subprocess
+            import sys
+
+            meta = job_info.metadata or {}
+
+            run_id = meta.get("run_id")
+            world_size = meta.get("world_size", 2)
+            total_steps = meta.get("total_steps", 100)
+
+            if not run_id:
+                logger.error("Recovery failed: run_id missing in metadata")
+                return
+
+            logger.warning(f"[RECOVERY] Relaunching workers for job={job_id}")
+
+            
+
+            for rank in range(world_size):
+                cmd = [
+                    sys.executable,
+                    "src/worker/runtime.py",
+                    "--rank", str(rank),
+                    "--world-size", str(world_size),
+                    "--job-id", job_id,
+                    "--run-id", run_id,
+                    "--coordinator-url", "http://127.0.0.1:8000",
+                    "--backend", "gloo",
+                    "--total-steps", str(total_steps),
+                ]
+
+                subprocess.Popen(cmd)
+
             job_info.recovery_attempts += 1
             job_info.updated_at = datetime.now(timezone.utc)
 
