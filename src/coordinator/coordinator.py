@@ -468,6 +468,18 @@ class Coordinator:
         self._jobs_lock = asyncio.Lock()
 
         self.worker_registry = WorkerRegistry()
+        # metrics_store holds per-job, per-step aggregated metrics
+        # Structure:
+        # { job_id: {
+        #     "steps": {
+        #         step_number: {
+        #             "worker_metrics": { worker_id: metrics_dict },
+        #             "aggregated": {"avg_loss": float|None, "total_throughput": float, "workers_reported": int}
+        #         }
+        #     },
+        #     "run_summary": {"latest_step": int|None, "latest_loss": float|None, "best_loss": float|None, "avg_throughput": float|None}
+        # } }
+        self._metrics_store: Dict[str, Dict[str, Any]] = {}
 
         self.heartbeat_monitor = HeartbeatMonitor(
             worker_registry=self.worker_registry,
@@ -638,6 +650,12 @@ class Coordinator:
             worker_id=heartbeat.worker_id,
             metrics=heartbeat.metrics,
         )
+
+        # Process metrics for aggregation (per-step)
+        try:
+            await self._process_metrics_from_heartbeat(heartbeat)
+        except Exception as e:
+            logger.error(f"Error processing metrics from heartbeat: {e}", exc_info=True)
 
         logger.debug(f"Heartbeat received from worker {heartbeat.worker_id}")
 
@@ -840,6 +858,118 @@ class Coordinator:
                 job_info.status = JobState.FAILED
                 job_info.error_message = f"Resume failed: {e}"
                 job_info.completed_at = datetime.now(timezone.utc)
+
+    async def _process_metrics_from_heartbeat(self, heartbeat: HeartbeatPayload) -> None:
+        """Aggregate metrics by job and step.
+
+        Rules:
+        - loss: average across workers that reported loss for the step
+        - throughput: sum across workers for the step
+        - workers_reported: number of distinct workers reporting for the step
+
+        The metrics_store layout is described in __init__.
+        """
+        # find worker and job
+        worker = await self.worker_registry.get_worker(heartbeat.worker_id)
+        if not worker:
+            # Unknown worker — nothing to aggregate
+            return
+
+        job_id = worker.job_id
+        metrics = heartbeat.metrics or {}
+
+        # step must be present to perform per-step aggregation
+        step = metrics.get("step")
+
+        # ensure job store exists
+        if job_id not in self._metrics_store:
+            self._metrics_store[job_id] = {"steps": {}, "run_summary": {"latest_step": None, "latest_loss": None, "best_loss": None, "avg_throughput": None}}
+
+        job_store = self._metrics_store[job_id]
+        steps_store: Dict[int, Dict[str, Any]] = job_store["steps"]
+
+        if step is None:
+            # No per-step info: update nothing further (we do not append raw entries)
+            return
+
+        # normalize step to int (if possible)
+        try:
+            step_key = int(step)
+        except Exception:
+            # non-integer step — ignore for aggregation
+            return
+
+        # ensure step store exists
+        if step_key not in steps_store:
+            steps_store[step_key] = {"worker_metrics": {}, "aggregated": {"avg_loss": None, "total_throughput": 0.0, "workers_reported": 0}}
+
+        step_entry = steps_store[step_key]
+        worker_metrics: Dict[str, Dict[str, Any]] = step_entry["worker_metrics"]
+
+        # update worker's metrics for this step (replace previous if present)
+        worker_metrics[heartbeat.worker_id] = metrics
+
+        # recompute aggregated values for this step from worker_metrics
+        losses = []
+        total_throughput = 0.0
+
+        for wm in worker_metrics.values():
+            # loss: may be missing
+            try:
+                if wm.get("loss") is not None:
+                    losses.append(float(wm.get("loss")))
+            except Exception:
+                # ignore malformed loss
+                pass
+
+            try:
+                if wm.get("throughput") is not None:
+                    total_throughput += float(wm.get("throughput"))
+            except Exception:
+                # ignore malformed throughput
+                pass
+
+        workers_reported = len(worker_metrics)
+        avg_loss = (sum(losses) / len(losses)) if losses else None
+
+        step_entry["aggregated"] = {
+            "avg_loss": avg_loss,
+            "total_throughput": total_throughput,
+            "workers_reported": workers_reported,
+        }
+
+        # update run summary using aggregated step values (not raw entries)
+        run_summary = job_store["run_summary"]
+
+        # latest_step: choose max seen step
+        prev_latest = run_summary.get("latest_step")
+        if prev_latest is None or step_key >= prev_latest:
+            run_summary["latest_step"] = step_key
+            run_summary["latest_loss"] = avg_loss
+
+        # best_loss: min across aggregated step avg_loss values (skip None)
+        best = None
+        tot_throughputs = []
+        for sdata in steps_store.values():
+            agg = sdata.get("aggregated", {})
+            al = agg.get("avg_loss")
+            if al is not None:
+                if best is None or al < best:
+                    best = al
+            tt = agg.get("total_throughput")
+            if tt is not None:
+                tot_throughputs.append(tt)
+
+        run_summary["best_loss"] = best
+
+        # avg_throughput across steps: average of per-step total_throughput
+        if tot_throughputs:
+            run_summary["avg_throughput"] = sum(tot_throughputs) / len(tot_throughputs)
+        else:
+            run_summary["avg_throughput"] = None
+
+        # commit back
+        job_store["run_summary"] = run_summary
 
     def _on_job_state_transition(
         self, job_id: str, from_state: str, to_state: str
