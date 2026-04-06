@@ -650,10 +650,12 @@ class Coordinator:
         job_id = worker.job_id
         await self.worker_registry.mark_worker_lost(worker_id)
         logger.warning(f"Worker {worker_id} reported exit (job: {job_id})")
+        logger.info(f"Failure detected time: {datetime.now(timezone.utc)}")
         await self._trigger_recovery(job_id, worker_id)
 
     async def _on_worker_lost(self, worker_id: str) -> None:
         logger.error(f"Worker lost detected: {worker_id}")
+        logger.info(f"Failure detected time: {datetime.now(timezone.utc)}")
 
         worker = await self.worker_registry.get_worker(worker_id)
         if not worker:
@@ -712,6 +714,7 @@ class Coordinator:
                 return
 
             logger.warning(f"[RECOVERY] Relaunching workers for job={job_id}")
+            logger.info(f"Recovery started: {datetime.now(timezone.utc)}")
 
             
 

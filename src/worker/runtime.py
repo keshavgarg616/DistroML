@@ -10,6 +10,7 @@ import time
 import socket
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -367,6 +368,7 @@ class WorkerRuntime:
     
         if start_step > 0:
             logger.info(f"Resuming training from step {start_step} to {total_steps}")
+            logger.info(f"Training resumed: {datetime.now(timezone.utc)}")
         else:
             logger.info(f"Starting training loop: {total_steps} steps")
 
