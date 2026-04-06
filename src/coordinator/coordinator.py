@@ -461,7 +461,7 @@ class HeartbeatMonitor:
 
 class Coordinator:
 
-    def __init__(self, config: Optional[CoordinatorConfig] = None):
+    def __init__(self, config: Optional[CoordinatorConfig] = None, ws_manager=None):
         self.config = config or CoordinatorConfig()
 
         self._jobs: Dict[str, Tuple[JobInfo, JobStateMachine]] = {}
@@ -476,6 +476,9 @@ class Coordinator:
             on_worker_lost=self._on_worker_lost,
         )
         self._checkpoint_reports = {}
+
+        # WebSocket manager for real-time state broadcasting
+        self.ws_manager = ws_manager
 
         logger.info(f"Coordinator initialized with config: {self.config}")
 
@@ -662,6 +665,10 @@ class Coordinator:
             logger.warning(f"Cannot find worker {worker_id} to handle loss")
             return
 
+        # Send shutdown command to worker via WebSocket
+        if self.ws_manager:
+            await self.ws_manager.send_shutdown_to_worker(worker_id, "heartbeat_timeout")
+
         job_id = worker.job_id
         await self._trigger_recovery(job_id, worker_id)
 
@@ -847,7 +854,24 @@ class Coordinator:
     def _on_job_state_transition(
         self, job_id: str, from_state: str, to_state: str
     ) -> None:
+        """
+        Callback invoked on job state transitions.
+        Broadcasts state changes via WebSocket to connected clients.
+        """
         logger.info(f"Job {job_id} state transition: {from_state} → {to_state}")
+
+        # Broadcast state change via WebSocket
+        if self.ws_manager:
+            state_data = {
+                "old_state": from_state,
+                "new_state": to_state,
+                "transition_time": datetime.now(timezone.utc).isoformat(),
+            }
+
+            # Schedule broadcast
+            asyncio.create_task(
+                self.ws_manager.broadcast_state_update(job_id, state_data)
+            )
 
     def __repr__(self) -> str:
         return f"Coordinator(jobs={len(self._jobs)}, config={self.config})"

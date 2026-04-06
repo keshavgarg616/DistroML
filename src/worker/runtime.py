@@ -108,6 +108,10 @@ class WorkerRuntime:
         self.model = torch.nn.Linear(10, 1)
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
 
+        # WebSocket streaming thread for real-time metrics/logs
+        self.ws_streamer = None
+        self._enable_websocket = True  # Can be disabled for testing/fallback
+
         logger.info(
             f"Worker initialized: id={config.worker_id}, "
             f"rank={config.rank}/{config.world_size}, "
@@ -269,17 +273,88 @@ class WorkerRuntime:
             self.state = WorkerState.FAILED
             return False
 
+    def start_websocket_streaming(self):
+        """
+        Initialize and start WebSocket streaming thread.
+
+        This runs WebSocket operations in a background thread, allowing
+        synchronous training code to stream metrics without blocking.
+        """
+        if not self._enable_websocket:
+            logger.info("WebSocket streaming disabled")
+            return
+
+        try:
+            from src.worker.websocket_thread import WebSocketStreamingThread
+
+            self.ws_streamer = WebSocketStreamingThread(
+                coordinator_url=self.config.coordinator_url,
+                job_id=self.config.job_id,
+                worker_id=self.config.worker_id
+            )
+            self.ws_streamer.start()
+            logger.info("WebSocket streaming started in background thread")
+        except ImportError:
+            logger.warning("websockets library not installed. Falling back to HTTP only.")
+            self.ws_streamer = None
+        except Exception as e:
+            logger.warning(f"Failed to start WebSocket streaming: {e}. Falling back to HTTP only.")
+            self.ws_streamer = None
+
+    def stop_websocket_streaming(self):
+        if self.ws_streamer:
+            try:
+                self.ws_streamer.stop(timeout=5.0)
+                logger.info("WebSocket streaming stopped")
+            except Exception as e:
+                logger.error(f"Error stopping WebSocket streamer: {e}")
+
     def emit_metrics(self, metrics: WorkerMetrics):
-        """Send training metrics to Coordinator"""
         metrics_data = asdict(metrics)
         metrics_data["worker_id"] = self.config.worker_id
         metrics_data["rank"] = self.config.rank
 
+        logger.debug(f"emit_metrics called for step {metrics.step}")
+
+        # Try WebSocket first (non-blocking, thread-safe)
+        if self.ws_streamer and self.ws_streamer.is_streaming():
+            # Queue message for WebSocket thread to send
+            success = self.ws_streamer.send_metrics(metrics_data)
+            if not success:
+                logger.warning(f"WebSocket queue full, using HTTP fallback for step {metrics.step}")
+                # Queue full, use HTTP fallback
+                self._emit_metrics_http(metrics_data)
+        else:
+            # WebSocket not available, use HTTP
+            logger.debug(f"WebSocket not active, using HTTP fallback")
+            self._emit_metrics_http(metrics_data)
+
+    def _emit_metrics_http(self, metrics_data: dict):
+        """
+        HTTP fallback for metrics emission.
+        """
         try:
             url = f"{self.config.coordinator_url}/api/jobs/{self.config.job_id}/metrics"
             requests.post(url, json=metrics_data, timeout=5)
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Failed to emit metrics: {e}")
+            logger.warning(f"Failed to emit metrics via HTTP: {e}")
+
+    def stream_log(self, level: str, message: str, **kwargs):
+        """
+        Stream a log message via WebSocket.
+
+        Thread-safe: Can be called from synchronous code.
+
+        Args:
+            level: Log level (INFO, WARNING, ERROR, etc.)
+            message: Log message
+            **kwargs: Additional context
+        """
+        if self.ws_streamer and self.ws_streamer.is_streaming():
+            try:
+                self.ws_streamer.send_log(level, message, **kwargs)
+            except Exception as e:
+                logger.debug(f"Failed to stream log: {e}")
 
     def sync_gradients(self, model: nn.Module):
         """
@@ -559,7 +634,6 @@ class WorkerRuntime:
 
 
 def main():
-    
     import argparse
     import uuid
 
@@ -609,7 +683,11 @@ def main():
         logger.info(f"Worker {args.rank} starting registration...")
         worker.register()
 
-        # Step 2: Check for checkpoint and restore if found
+        # Step 2: Start WebSocket streaming for real-time metrics/logs
+        logger.info("Starting WebSocket streaming...")
+        worker.start_websocket_streaming()
+
+        # Step 3: Check for checkpoint and restore if found
         start_step = 0
         checkpoint_info = worker.find_latest_checkpoint()
 
@@ -621,21 +699,21 @@ def main():
         else:
             logger.info("No checkpoint found, starting fresh")
 
-        # Step 3: Initialize distributed training
+        # Step 4: Initialize distributed training
         logger.info("Initializing distributed training...")
         worker.init_distributed()
 
-        # Step 4: Synchronize all workers after restore (barrier)
+        # Step 5: Synchronize all workers after restore (barrier)
         if config.world_size > 1:
             logger.info("Waiting for all workers to reach barrier...")
             dist.barrier()
             logger.info("All workers synchronized")
 
-        # Step 5: Start heartbeat thread
+        # Step 6: Start heartbeat thread
         logger.info("Starting heartbeat thread...")
         worker.start_heartbeat()
 
-        # Step 6: Run training loop
+        # Step 7: Run training loop
         logger.info("Starting training...")
         worker.training_loop(total_steps=args.total_steps, start_step=start_step)
 
@@ -649,6 +727,7 @@ def main():
     finally:
         # Cleanup
         worker.stop_heartbeat()
+        worker.stop_websocket_streaming()
         if worker.dist_initialized:
             dist.destroy_process_group()
 
