@@ -1,155 +1,145 @@
-# Chaos testing & failure behaviour — audit (Week 5–6)
+# Chaos testing and failure behaviour (Week 5-6)
 
 ## Summary
 
-- **What exists in code:** heartbeat-based failure detection, optional explicit worker exit handling, a recovery path that can move a job to `RECOVERING`, relaunch worker processes, and log failure/recovery timestamps. Workers support **failure injection** (kill at step, pause, random heartbeat drops) inside `WorkerRuntime`, but **not** from the normal CLI entrypoint.
-- **What is missing or weak:** no dedicated chaos test suite (random failures, multi-failure runs). No pytest that kills a worker mid-training and asserts end-to-end recovery. Recovery often **does nothing** unless a job record exists in the coordinator (see scenario below). WebSocket streaming can be ignored for chaos scope, as requested.
-- **Automated tests run:** `pytest tests/` — **19 passed** (temp venv with torch + project deps; root `requirements.txt` lists invalid PyPI names like `logging`, `asyncio`, so installs must skip those lines or use a fixed file).
+- Heartbeat timeout detection is implemented and still the main crash detector.
+- Clean worker finish is now handled via `POST /api/workers/complete`, which removes workers from registry and helps avoid false LOST status after successful runs.
+- Recovery flow exists: job can move to `RECOVERING`, failed rank can be relaunched, and worker-side checkpoint restore can resume from latest checkpoint for the same `run_id`.
+- Job metadata defaults are now filled on submit (`run_id`, `world_size`, `total_steps`, `checkpoint_dir`) so recovery has required fields.
+- Main gaps remain: no end-to-end chaos integration tests, no automated time-to-recovery checks, and failure injection hooks are not exposed as CLI flags.
 
 ---
 
-## Code map (week tasks → where it lives)
+## What is implemented vs pending
 
-| Task | Present? | Location / notes |
-|------|----------|-------------------|
-| Heartbeat timeout | Yes | `HeartbeatMonitor` in `src/coordinator/coordinator.py` — stale workers → `mark_worker_lost` → `_on_worker_lost` |
-| Worker process exit detection | Partial | **Explicit:** `POST /api/workers/deregister` → `handle_worker_exit`. **Crash / kill:** only via missing heartbeats (no OS-level hook) |
-| Job → `RECOVERING`, relaunch, checkpoint resume | Partial | `_trigger_recovery` sets `RECOVERING`, logs `Recovery started`, spawns workers with `subprocess.Popen`. Checkpoint resume is implemented in **worker** (`find_latest_checkpoint` / `restore_checkpoint`); coordinator recovery comments still say “future: checkpoint logic” in `_check_recovery_status` |
-| Integration test: kill mid-training | No | Not found under `tests/` |
-| Time-to-recovery &lt; 60s | Not measured | Would need a job in `_jobs`, a real failure, and timestamps; not automated here |
-| Failure injection: kill step N, pause T, drop heartbeats | Yes (in-process) | `WorkerRuntime.configure_failure_injection` + `training_loop` / `_emit_heartbeat` in `src/worker/runtime.py` |
-| Recovery timeline logging | Partial | **Failure detected:** `Failure detected time:` in `_on_worker_lost` / `handle_worker_exit`. **Recovery started:** `Recovery started:` in `_trigger_recovery`. **Training resumed:** log when resuming from checkpoint (`start_step > 0`) in `training_loop` |
-| Chaos: random failures, multiple failures | No | No scenarios in repo tests |
-
----
-
-## Automated test run (what we executed)
-
-- **Command:** `PYTHONPATH=. python -m pytest tests/ -q`
-- **Environment:** Python 3.13 venv with `pytest`, `torch`, `requests`, `pydantic`, `python-statemachine`, etc. (invalid requirements lines omitted).
-- **Result:** **19 passed**, ~6.4s.
-- **Coverage:** mostly **checkpoint restore/manifest** (`tests/test_checkpoint_restore.py`), plus `tests/test_dataloader.py` and `tests/test_websocket_streaming.py`. **None** of these are end-to-end chaos or kill-and-recovery tests.
+| Task | Status | Notes |
+|------|--------|-------|
+| Heartbeat timeout | Implemented | `HeartbeatMonitor` checks stale workers, marks LOST, calls recovery callback |
+| Worker exit detection | Partial | Explicit exit endpoint exists (`/api/workers/deregister`), crash/kill still inferred through missed heartbeat |
+| Graceful success shutdown | Implemented | Worker calls `/api/workers/complete`; coordinator deregisters worker without triggering recovery |
+| Job `RECOVERING` transition | Implemented | Coordinator transitions RUNNING -> RECOVERING on loss |
+| Relaunch worker(s) | Implemented (single failed rank) | Recovery now relaunches failed rank only |
+| Resume from checkpoint | Partial but wired | Worker restores from latest checkpoint using `run_id` and `checkpoint_dir`; coordinator does not deeply validate checkpoint progress |
+| Kill worker mid-training integration test | Missing | Not present in `tests/` |
+| Recovery continuation verification test | Missing | Not present in `tests/` |
+| Time-to-recovery measurement (<60s) | Missing | No automated metric or assertion |
+| Failure injection hooks (kill/pause/drop heartbeat) | Implemented in runtime | Available in code, not exposed in worker CLI |
+| Recovery timeline logging | Implemented | Logs include failure detected and recovery started; training resumed logged by worker when restoring |
+| Chaos scenarios (random/multi-failure) | Missing | No dedicated suite/script in repo |
 
 ---
 
-## Scenario 1 — Happy path (launcher + coordinator, 4 workers, 100 steps)
+## Test run (latest)
 
-**What you did:** Coordinator on `127.0.0.1:8000`, workers via `python -m src.worker.launcher`, `gloo`, same job/run IDs.
+- Command: `PYTHONPATH=. python -m pytest tests/ -q`
+- Result: **19 passed**
+- Coverage focus:
+  - checkpoint restore and manifest behaviour
+  - dataloader tests
+  - websocket tests (not relevant for this doc scope)
+- Not covered by automated tests:
+  - kill mid-training then recover
+  - multiple failures across runs
+  - recovery time target
+
+---
+
+## Scenario details (WebSockets intentionally ignored)
+
+## 1) Normal training run (4 workers, no injected failure)
 
 **What went right**
 
-- All four workers registered and finished training.
-- Heartbeats and HTTP metrics returned 200 during the run.
-- Barrier and training loop completed; launcher reported all workers successful.
+- Workers register, train, and finish.
+- Heartbeats and metrics APIs are used as expected.
+- Workers call `/api/workers/complete` on successful finish.
+- Workers are removed from registry instead of waiting for heartbeat timeout.
 
-**What went wrong / gaps**
+**What can still go wrong**
 
-- WebSocket URL returned 404 and uvicorn warned about missing WebSocket extras — **out of scope** if we ignore streaming.
-- After workers exited, the coordinator later logged workers as **heartbeat stale** and **LOST**, plus **“Cannot trigger recovery - job not found”**.
-
-**Why**
-
-- Workers stopped sending heartbeats when processes ended; the monitor still treats that as failure after the timeout window.
-- **Jobs are not created** when workers-only register. `register_worker` adds workers to the registry but does **not** call `submit_job`, so `self._jobs[job_id]` is empty → recovery cannot run. That matches the warning in your logs.
+- If `/api/workers/complete` fails repeatedly (network/coordinator issue), worker exits anyway and may later be marked LOST by heartbeat timeout.
+- In launcher-only flow (no submitted job record), there is still no job lifecycle state to complete; only worker-level cleanup happens.
 
 ---
 
-## Scenario 2 — Heartbeat timeout detection
-
-**What the code does**
-
-- Periodically finds workers whose last heartbeat is older than the configured timeout, marks them **LOST**, logs **failure detected**, then tries `_trigger_recovery`.
+## 2) Heartbeat timeout failure
 
 **What went right**
 
-- Timeout path is implemented and logged clearly in real runs (stale heartbeats → LOST).
+- Stale worker detection is active and marks worker LOST.
+- Recovery callback is triggered with clear timeline logs.
 
-**What went wrong**
+**What can still go wrong**
 
-- Without a submitted job, recovery stops at **“job … not found”**.
-- Treating **normal shutdown** the same as **crash** (no deregister) produces noisy LOST events after a successful run.
+- If job is not present in coordinator `_jobs` (workers registered directly), recovery cannot proceed (`job not found`).
 
 ---
 
-## Scenario 3 — Explicit worker exit (`/api/workers/deregister`)
-
-**What the code does**
-
-- Marks worker lost, logs failure time, calls `_trigger_recovery`.
+## 3) Explicit failure exit (`/api/workers/deregister`)
 
 **What went right**
 
-- Clear hook for “worker told us it is exiting” (different from silent crash).
+- Clear endpoint path to mark worker exit as failure and trigger recovery.
 
-**What went wrong**
+**What can still go wrong**
 
-- Workers in the current launcher/runtime path do not appear to call this on clean exit, so this path is easy to miss in local runs.
+- This path is for failure semantics, not clean completion.
+- If used incorrectly for normal finish, it can trigger unnecessary recovery.
 
 ---
 
-## Scenario 4 — Recovery orchestration (`RECOVERING`, relaunch)
-
-**What the code does**
-
-- If the job exists in `_jobs`, transitions to `RECOVERING`, logs recovery start, spawns one subprocess per rank with `python src/worker/runtime.py ...` (working directory must allow that path; differs from `python -m src.worker.runtime`).
+## 4) Recovery orchestration (`RECOVERING` and relaunch)
 
 **What went right**
 
-- State transition and subprocess relaunch are implemented; metadata can carry `run_id`, `world_size`, `total_steps` for relaunch.
+- Coordinator transitions to `RECOVERING`.
+- Relaunch command now uses module form with correct cwd and `PYTHONPATH`.
+- Recovery uses metadata defaults and passes `checkpoint_dir`.
+- Failed rank relaunch avoids immediate duplicate restart of all ranks.
 
-**What went wrong**
+**What can still go wrong**
 
-- **Job must be created first** via `POST /api/jobs` with metadata your recovery code expects (`run_id` in `job_spec.metadata`, etc.). Launcher-only workflows never create that job.
-- Relaunch command may fail if cwd / Python path does not match how you normally start workers.
-- Full **checkpoint-driven** recovery is not fully wired in the coordinator’s `_check_recovery_status` (comments still describe future work).
+- Single-rank relaunch can still stall distributed training if other ranks are already blocked in collectives.
+- Recovery health check is still coarse (based on worker status, not full rank sync/progress validation).
 
 ---
 
-## Scenario 5 — Failure injection (kill / pause / drop heartbeat)
-
-**What exists**
-
-- `kill_at_step` → `sys.exit(1)` inside the training loop.
-- `pause_at_step` + `pause_duration` → sleep in-loop.
-- `drop_heartbeat_rate` → skip sending some heartbeats.
+## 5) Failure injection hooks (kill, pause, drop heartbeat)
 
 **What went right**
 
-- Hooks are easy to find and reason about for controlled experiments.
+- All three hooks exist in worker runtime and are easy to call from code/tests.
 
-**What went wrong**
+**What can still go wrong**
 
-- **`main()` does not expose CLI flags** for these; injection requires calling `configure_failure_injection` from code or a custom script.
-- No automated tests in `tests/` drive these hooks.
-
----
-
-## Scenario 6 — “Chaos” (random failures, multiple failures per run)
-
-**What exists**
-
-- No random scheduler, no multi-failure scenario tests in the repository.
-
-**What went wrong**
-
-- Week 6 chaos objectives are **not** covered by automated tests yet.
+- No CLI flags in worker entrypoint for these hooks.
+- No automated integration tests currently use them end-to-end.
 
 ---
 
-## Recommendations for future test docs (not implemented here)
+## 6) Chaos scenarios (random and multiple failures)
 
-- Add a **job submission** step before workers so recovery can run, or auto-create/link jobs on worker registration.
-- Add pytest or a script that: submits job → starts workers → injects kill → asserts coordinator state and worker resume within a time budget.
-- Expose failure-injection flags on `src.worker.runtime` CLI for repeatable chaos runs.
-- Clean shutdown: call deregister or stop heartbeat monitor expectations on normal completion to avoid false LOST signals.
+**Current state**
+
+- No dedicated chaos runner or integration suite in repository.
+- No repeated-run harness to validate stability after multiple random failures.
 
 ---
 
-## Quick reference — files
+## Remaining high-priority gaps
+
+- Add integration test: kill one worker mid-training, verify recovery and continued progress.
+- Add integration test: multiple failures across runs, verify no deadlock and correct final state.
+- Add recovery timing instrumentation and assert `<60s` target.
+- Add CLI flags for failure injection hooks for repeatable local chaos runs.
+
+---
+
+## Key files
 
 | Area | File(s) |
 |------|---------|
-| Heartbeat monitor & recovery | `src/coordinator/coordinator.py` |
-| Worker failure injection | `src/worker/runtime.py` |
-| API (jobs, workers, deregister) | `src/coordinator/main.py` |
+| Heartbeat and recovery orchestration | `src/coordinator/coordinator.py` |
+| Coordinator APIs for worker lifecycle | `src/coordinator/main.py` |
+| Worker runtime and failure injection hooks | `src/worker/runtime.py` |
 | Checkpoint tests | `tests/test_checkpoint_restore.py` |

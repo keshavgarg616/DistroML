@@ -176,6 +176,36 @@ class WorkerRuntime:
             logger.error(f"Registration request failed: {e}")
             return False
 
+    def notify_training_complete(self) -> None:
+        """Tell the coordinator this worker finished training so it is not marked LOST."""
+        url = f"{self.config.coordinator_url.rstrip('/')}/api/workers/complete"
+        delays = (0.0, 0.5, 1.0)
+        last_err: Optional[str] = None
+        for attempt, delay in enumerate(delays):
+            if delay:
+                time.sleep(delay)
+            try:
+                response = requests.post(
+                    url,
+                    json={"worker_id": self.config.worker_id},
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    logger.info("Notified coordinator of clean training shutdown")
+                    return
+                last_err = f"HTTP {response.status_code} {response.text}"
+                logger.warning(
+                    f"Complete notification attempt {attempt + 1}/{len(delays)}: {last_err}"
+                )
+            except requests.exceptions.RequestException as e:
+                last_err = str(e)
+                logger.warning(
+                    f"Complete notification attempt {attempt + 1}/{len(delays)}: {e}"
+                )
+        logger.warning(
+            f"Could not notify coordinator of clean shutdown after retries: {last_err}"
+        )
+
     def _emit_heartbeat(self):
         """Send heartbeat to Coordinator"""
         # Failure Injection: Drop Heartbeat
@@ -719,6 +749,7 @@ def main():
         logger.info("Starting training...")
         worker.training_loop(total_steps=args.total_steps, start_step=start_step)
 
+        worker.notify_training_complete()
         logger.info("Worker completed successfully")
 
     except Exception as e:

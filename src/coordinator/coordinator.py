@@ -10,13 +10,16 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List, Callable, Awaitable, Any
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from src.coordinator.manifest import build_manifest, save_manifest
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from statemachine import StateMachine, State
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 from .models import (
     WorkerResources,
@@ -41,6 +44,9 @@ from ..common import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Project root (…/DistroML) for subprocess worker relaunch
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CoordinatorConfig(BaseSettings):
@@ -79,6 +85,11 @@ class CoordinatorConfig(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
     )
 
+    coordinator_base_url: str = Field(
+        default="http://127.0.0.1:8000",
+        description="Base URL workers use to reach this coordinator (recovery relaunch)",
+    )
+
     model_config = SettingsConfigDict(
         env_prefix="DISTROML_",
         env_file=".env",
@@ -107,7 +118,7 @@ class JobStateMachine(StateMachine):
 
     Transitions:
         - start: QUEUED → RUNNING
-        - complete: RUNNING → COMPLETED
+        - complete: RUNNING → COMPLETED, RECOVERING → COMPLETED (all workers finished cleanly)
         - fail: RUNNING/RECOVERING → FAILED
         - recover: RUNNING → RECOVERING
         - resume: RECOVERING → RUNNING
@@ -122,7 +133,7 @@ class JobStateMachine(StateMachine):
     cancelled = State(JobState.CANCELLED, final=True, value=JobState.CANCELLED)
 
     start = queued.to(running)
-    complete = running.to(completed)
+    complete = running.to(completed) | recovering.to(completed)
     fail = running.to(failed) | recovering.to(failed)
     recover = running.to(recovering)
     resume = recovering.to(running)
@@ -513,11 +524,18 @@ class Coordinator:
     async def submit_job(self, job_spec: JobSpec) -> str:
         job_id = str(uuid.uuid4())
 
+        merged_meta: Dict[str, Any] = dict(job_spec.metadata or {})
+        if "run_id" not in merged_meta:
+            merged_meta["run_id"] = str(uuid.uuid4())
+        merged_meta.setdefault("world_size", job_spec.world_size)
+        merged_meta.setdefault("total_steps", 100)
+        merged_meta.setdefault("checkpoint_dir", "./checkpoints")
+
         job_info = JobInfo(
             id=job_id,
             name=job_spec.name,
             status=JobState.QUEUED,
-            metadata=job_spec.metadata,
+            metadata=merged_meta,
         )
 
         state_machine = JobStateMachine(
@@ -674,6 +692,51 @@ class Coordinator:
         logger.info(f"Failure detected time: {datetime.now(timezone.utc)}")
         await self._trigger_recovery(job_id, worker_id)
 
+    async def handle_worker_complete(self, worker_id: str) -> None:
+        """
+        Called when a worker finishes training successfully.
+        Removes the worker from the registry (no recovery). If a tracked job
+        exists and is RUNNING, marks the job COMPLETED when the last worker
+        for that job shuts down cleanly.
+        """
+        worker = await self.worker_registry.get_worker(worker_id)
+        if not worker:
+            raise WorkerNotFoundError(worker_id)
+
+        job_id = worker.job_id
+        await self.worker_registry.deregister_worker(worker_id)
+        logger.info(
+            f"Worker {worker_id} completed training and deregistered (job {job_id})"
+        )
+
+        remaining = await self.worker_registry.get_workers_by_job(job_id)
+        if len(remaining) > 0:
+            return
+
+        async with self._jobs_lock:
+            if job_id not in self._jobs:
+                return
+
+            job_info, state_machine = self._jobs[job_id]
+            if job_info.status not in (JobState.RUNNING, JobState.RECOVERING):
+                logger.debug(
+                    f"Job {job_id} not auto-completed (status={job_info.status})"
+                )
+                return
+
+            if not state_machine.safe_transition("complete"):
+                logger.warning(
+                    f"Could not complete job {job_id} from state "
+                    f"{state_machine.get_current_state()}"
+                )
+                return
+
+            job_info.status = JobState.COMPLETED
+            job_info.completed_at = datetime.now(timezone.utc)
+            job_info.updated_at = datetime.now(timezone.utc)
+
+        logger.info(f"Job {job_id} completed (all workers finished successfully)")
+
     async def _on_worker_lost(self, worker_id: str) -> None:
         logger.error(f"Worker lost detected: {worker_id}")
         logger.info(f"Failure detected time: {datetime.now(timezone.utc)}")
@@ -691,6 +754,14 @@ class Coordinator:
         await self._trigger_recovery(job_id, worker_id)
 
     async def _trigger_recovery(self, job_id: str, failed_worker_id: str) -> None:
+        failed_worker = await self.worker_registry.get_worker(failed_worker_id)
+        if failed_worker is None:
+            logger.error(
+                f"Recovery aborted: failed worker {failed_worker_id} not in registry"
+            )
+            return
+        failed_rank = failed_worker.rank
+
         async with self._jobs_lock:
             if job_id not in self._jobs:
                 logger.warning(f"Cannot trigger recovery - job {job_id} not found")
@@ -725,38 +796,59 @@ class Coordinator:
 
             job_info.status = JobState.RECOVERING
 
-            import subprocess
-            import sys
-
             meta = job_info.metadata or {}
 
             run_id = meta.get("run_id")
             world_size = meta.get("world_size", 2)
             total_steps = meta.get("total_steps", 100)
+            checkpoint_dir = meta.get("checkpoint_dir", "./checkpoints")
 
             if not run_id:
                 logger.error("Recovery failed: run_id missing in metadata")
                 return
 
-            logger.warning(f"[RECOVERY] Relaunching workers for job={job_id}")
+            logger.warning(
+                f"[RECOVERY] Relaunching worker rank {failed_rank} only "
+                f"(failed_worker_id={failed_worker_id}) for job={job_id}"
+            )
             logger.info(f"Recovery started: {datetime.now(timezone.utc)}")
+            logger.info(
+                "Recovery: relaunched worker loads checkpoints under run_id=%s "
+                "checkpoint_dir=%s (find_latest_checkpoint / restore_checkpoint)",
+                run_id,
+                checkpoint_dir,
+            )
 
-            
+            root = str(_PROJECT_ROOT)
+            env = os.environ.copy()
+            pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = root if not pp else f"{root}{os.pathsep}{pp}"
 
-            for rank in range(world_size):
-                cmd = [
-                    sys.executable,
-                    "src/worker/runtime.py",
-                    "--rank", str(rank),
-                    "--world-size", str(world_size),
-                    "--job-id", job_id,
-                    "--run-id", run_id,
-                    "--coordinator-url", "http://127.0.0.1:8000",
-                    "--backend", "gloo",
-                    "--total-steps", str(total_steps),
-                ]
+            base_url = self.config.coordinator_base_url.rstrip("/")
 
-                subprocess.Popen(cmd)
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.worker.runtime",
+                "--rank",
+                str(failed_rank),
+                "--world-size",
+                str(world_size),
+                "--job-id",
+                job_id,
+                "--run-id",
+                run_id,
+                "--coordinator-url",
+                base_url,
+                "--backend",
+                "gloo",
+                "--total-steps",
+                str(total_steps),
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+            ]
+
+            subprocess.Popen(cmd, cwd=root, env=env)
 
             job_info.recovery_attempts += 1
             job_info.updated_at = datetime.now(timezone.utc)
@@ -793,8 +885,8 @@ class Coordinator:
         Check recovery status after backoff period and decide to resume or fail.
 
         This runs after RECOVERY_BACKOFF_SECONDS to give workers time to:
-        1. Re-register if they restarted (future: auto-relaunch)
-        2. Restore from checkpoint (future: checkpoint logic)
+        1. Re-register after relaunch
+        2. Restore from checkpoint on the worker (same run_id in job metadata)
         3. Rejoin the training process
 
         Current behavior:
@@ -856,6 +948,11 @@ class Coordinator:
             logger.info(
                 f"Resuming job {job_id} with {len(alive_workers)}/{len(all_workers)} workers "
                 f"after recovery attempt {attempt_number}"
+            )
+            logger.info(
+                "Training resumed (coordinator): job %s back to RUNNING; "
+                "workers continue from checkpoint if present for run_id in metadata",
+                job_id,
             )
 
             try:

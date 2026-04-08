@@ -132,6 +132,26 @@ async def deregister_worker(payload: dict):
         raise HTTPException(status_code=404, detail="Worker not found")
 
 
+@app.post(
+    "/api/workers/complete",
+    status_code=200,
+    tags=["Workers"],
+    summary="Worker finished training successfully",
+)
+async def worker_training_complete(payload: dict):
+    """Remove worker from registry without triggering recovery."""
+    try:
+        worker_id = payload.get("worker_id")
+        if not worker_id:
+            raise HTTPException(
+                status_code=400, detail="worker_id is required"
+            )
+        await coordinator.handle_worker_complete(worker_id)
+        return {"status": "completed"}
+    except WorkerNotFoundError:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+
 @app.get(
     "/api/cluster/workers",
     response_model=List[WorkerInfo],

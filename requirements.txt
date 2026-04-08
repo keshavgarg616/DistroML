@@ -6,7 +6,7 @@ python-json-logger>=2.0
 torch>=2.0
 numpy>=1.20
 python-statemachine>=1.0
-logging>=1.0
-asyncio>=3.0
-typing>=4.0
-datetime>=5.0
+# fastapi stack (coordinator API)
+fastapi>=0.100
+uvicorn[standard]>=0.23
+requests>=2.28
