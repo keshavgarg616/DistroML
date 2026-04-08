@@ -701,8 +701,10 @@ def main():
 
         # Step 4: Initialize distributed training
         logger.info("Initializing distributed training...")
-        worker.init_distributed()
-
+        distributed_initialised = worker.init_distributed()
+        if not distributed_initialised:
+            logger.error("Failed to initialize distributed training")
+            sys.exit(1)
         # Step 5: Synchronize all workers after restore (barrier)
         if config.world_size > 1:
             logger.info("Waiting for all workers to reach barrier...")

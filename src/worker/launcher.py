@@ -40,7 +40,7 @@ class WorkerLauncher:
             cmd = [
                 sys.executable,
                 "-m",
-                "runtime",
+                "src.worker.runtime",
                 "--rank",
                 str(rank),
                 "--world-size",
