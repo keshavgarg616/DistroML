@@ -1,11 +1,9 @@
 """
-Week 5 integration test:
+This test is for the recovery orchestration. 
 - Simulate worker loss mid-job
 - Verify Coordinator transitions RUNNING -> RECOVERING -> RUNNING
 - Verify Coordinator attempts to relaunch the failed rank
 
-Note: This test runs the Coordinator in-process and patches subprocess.Popen so
-no real worker processes are spawned.
 """
 
 import asyncio
