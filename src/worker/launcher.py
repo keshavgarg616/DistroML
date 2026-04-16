@@ -25,6 +25,10 @@ class WorkerLauncher:
         backend: str = "gloo",
         coordinator_url: str = "http://localhost:8000",
         total_steps: int = 100,
+        kill_at_step: int | None = None,
+        pause_at_step: int | None = None,
+        pause_duration: int = 0,
+        drop_heartbeat_rate: float = 0.0,
     ):
         """Launch multiple worker processes"""
 
@@ -56,6 +60,16 @@ class WorkerLauncher:
                 "--total-steps",
                 str(total_steps),
             ]
+
+            # Week 6 failure-injection flags (optional)
+            if kill_at_step is not None:
+                cmd.extend(["--kill-at-step", str(kill_at_step)])
+            if pause_at_step is not None:
+                cmd.extend(["--pause-at-step", str(pause_at_step)])
+            if pause_duration:
+                cmd.extend(["--pause-duration", str(pause_duration)])
+            if drop_heartbeat_rate:
+                cmd.extend(["--drop-heartbeat-rate", str(drop_heartbeat_rate)])
 
             print(f"Starting worker {rank}...")
 
@@ -145,6 +159,32 @@ def main():
     )
     parser.add_argument("--steps", type=int, default=100, help="Total training steps")
 
+    # Week 6 failure-injection flags (applied to all launched workers)
+    parser.add_argument(
+        "--kill-at-step",
+        type=int,
+        default=None,
+        help="Injected failure: hard-exit the worker at the given step",
+    )
+    parser.add_argument(
+        "--pause-at-step",
+        type=int,
+        default=None,
+        help="Injected failure: pause the worker at the given step",
+    )
+    parser.add_argument(
+        "--pause-duration",
+        type=int,
+        default=0,
+        help="Duration (seconds) to pause when --pause-at-step triggers",
+    )
+    parser.add_argument(
+        "--drop-heartbeat-rate",
+        type=float,
+        default=0.0,
+        help="Injected failure: probability [0.0-1.0] of dropping each heartbeat",
+    )
+
     args = parser.parse_args()
 
     launcher = WorkerLauncher()
@@ -155,6 +195,10 @@ def main():
             backend=args.backend,
             coordinator_url=args.coordinator_url,
             total_steps=args.steps,
+            kill_at_step=args.kill_at_step,
+            pause_at_step=args.pause_at_step,
+            pause_duration=args.pause_duration,
+            drop_heartbeat_rate=args.drop_heartbeat_rate,
         )
         launcher.monitor()
     except Exception as e:

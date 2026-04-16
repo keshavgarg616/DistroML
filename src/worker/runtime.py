@@ -690,6 +690,32 @@ def main():
         "--checkpoint-dir", type=str, default="./checkpoints", help="Checkpoint directory"
     )
 
+    # Week 6: failure injection CLI flags (for chaos testing)
+    parser.add_argument(
+        "--kill-at-step",
+        type=int,
+        default=None,
+        help="Injected failure: hard-exit the worker at the given step",
+    )
+    parser.add_argument(
+        "--pause-at-step",
+        type=int,
+        default=None,
+        help="Injected failure: pause the worker at the given step",
+    )
+    parser.add_argument(
+        "--pause-duration",
+        type=int,
+        default=0,
+        help="Duration (seconds) to pause when --pause-at-step triggers",
+    )
+    parser.add_argument(
+        "--drop-heartbeat-rate",
+        type=float,
+        default=0.0,
+        help="Injected failure: probability [0.0-1.0] of dropping each heartbeat",
+    )
+
     args = parser.parse_args()
 
     # Create worker configuration
@@ -707,6 +733,12 @@ def main():
 
     # Create and run worker
     worker = WorkerRuntime(config)
+    worker.configure_failure_injection(
+        kill_at_step=args.kill_at_step,
+        pause_at_step=args.pause_at_step,
+        pause_duration=args.pause_duration,
+        drop_heartbeat_rate=args.drop_heartbeat_rate,
+    )
 
     try:
         # Step 1: Register with coordinator

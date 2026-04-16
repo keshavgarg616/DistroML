@@ -6,6 +6,8 @@ from datetime import datetime
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from .coordinator import Coordinator, CoordinatorConfig
 from .websocket_manager import ConnectionManager
@@ -64,6 +66,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Week 7: minimal dashboard assets (no React dependency)
+_static_dir = "src/coordinator/static"
+try:
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+except Exception:
+    # If packaging/layout changes, mounting static is best-effort.
+    pass
+
 
 @app.post(
     "/api/jobs",
@@ -101,6 +111,12 @@ async def list_jobs():
     return await coordinator.list_jobs()
 
 
+@app.get(
+    "/api/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    summary="Get job status",
+)
 async def get_job_status(job_id: str):
     try:
         return await coordinator.get_job_status(job_id)
@@ -109,6 +125,117 @@ async def get_job_status(job_id: str):
     except Exception as e:
         logger.error(f"Error retrieving job {job_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get(
+    "/dashboard/{job_id}",
+    response_class=HTMLResponse,
+    tags=["Dashboard"],
+    summary="Minimal job dashboard (Week 7)",
+)
+async def dashboard(job_id: str):
+    """
+    Minimal built-in dashboard for Week 7.
+    Uses the WebSocket stream to display metrics/logs/state updates.
+    """
+    html = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DistroML Dashboard — {job_id}</title>
+    <style>
+      body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }}
+      .row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
+      .card {{ border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 14px; min-width: 320px; flex: 1; }}
+      code {{ background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }}
+      .muted {{ color: #6b7280; }}
+      #events {{ height: 380px; overflow: auto; white-space: pre-wrap; background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 12px; }}
+      .pill {{ display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; }}
+    </style>
+  </head>
+  <body>
+    <h2>DistroML — Job Dashboard</h2>
+    <div class="muted">Job ID: <code>{job_id}</code></div>
+    <div class="row" style="margin-top: 14px;">
+      <div class="card">
+        <div><strong>Connection</strong></div>
+        <div>Status: <span id="conn" class="pill">connecting…</span></div>
+        <div class="muted" style="margin-top: 8px;">
+          WebSocket: <code id="wsurl"></code>
+        </div>
+      </div>
+      <div class="card">
+        <div><strong>Latest metrics</strong></div>
+        <div>Step: <code id="step">-</code></div>
+        <div>Loss: <code id="loss">-</code></div>
+        <div>Throughput: <code id="thr">-</code></div>
+        <div>Worker: <code id="worker">-</code></div>
+      </div>
+      <div class="card">
+        <div><strong>Last state</strong></div>
+        <div><code id="state">-</code></div>
+      </div>
+    </div>
+
+    <h3 style="margin-top: 18px;">Live events</h3>
+    <div id="events"></div>
+
+    <script>
+      const jobId = {json.dumps(job_id)};
+      const scheme = (location.protocol === "https:") ? "wss" : "ws";
+      const wsUrl = `${{scheme}}://${{location.host}}/ws/jobs/${{jobId}}/stream`;
+      document.getElementById("wsurl").textContent = wsUrl;
+
+      const el = (id) => document.getElementById(id);
+      const events = el("events");
+      function logLine(line) {{
+        events.textContent += line + "\\n";
+        events.scrollTop = events.scrollHeight;
+      }}
+
+      let ws;
+      function connect() {{
+        ws = new WebSocket(wsUrl);
+        el("conn").textContent = "connected";
+
+        ws.onopen = () => {{
+          el("conn").textContent = "open";
+          logLine(`[open] ${{new Date().toISOString()}}`);
+        }};
+        ws.onclose = () => {{
+          el("conn").textContent = "closed";
+          logLine(`[close] ${{new Date().toISOString()}} — reconnecting…`);
+          setTimeout(connect, 1000);
+        }};
+        ws.onerror = (e) => {{
+          el("conn").textContent = "error";
+          logLine(`[error] ${{new Date().toISOString()}}`);
+        }};
+        ws.onmessage = (evt) => {{
+          try {{
+            const msg = JSON.parse(evt.data);
+            const t = msg.type || "unknown";
+            if (t === "metrics") {{
+              const d = msg.data || {{}};
+              el("step").textContent = d.step ?? "-";
+              el("loss").textContent = (d.loss !== undefined) ? Number(d.loss).toFixed(4) : "-";
+              el("thr").textContent = (d.throughput !== undefined) ? Number(d.throughput).toFixed(1) : "-";
+              el("worker").textContent = d.worker_id ?? "-";
+            }} else if (t === "state_update") {{
+              const d = msg.data || {{}};
+              el("state").textContent = `${{d.old_state}} → ${{d.new_state}}`;
+            }}
+            logLine(`[${{t}}] ${{msg.timestamp || ""}} ${{evt.data}}`);
+          }} catch (e) {{
+            logLine(`[raw] ${{evt.data}}`);
+          }}
+        }};
+      }}
+      connect();
+    </script>
+  </body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.post("/api/workers/register", status_code=status.HTTP_200_OK)
