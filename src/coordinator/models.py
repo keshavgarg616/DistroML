@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from ..common import JobState, WorkerStatus
@@ -107,3 +107,74 @@ class JobStatusResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat(),
         }
+
+
+
+class ExperimentMetadata(BaseModel):
+    """
+    Full experiment record stored at job submission time.
+    Captures everything needed to reproduce or compare a training run.
+    """
+    job_id: str = Field(description="Coordinator-assigned job UUID")
+    run_id: str = Field(description="Run UUID (stable across recovery attempts)")
+    recorded_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="When this record was created",
+    )
+
+    git_commit_hash: str = Field(
+        description="Git HEAD commit hash at submission time"
+    )
+    git_branch: str = Field(
+        default="unknown",
+        description="Git branch at submission time",
+    )
+
+    job_spec: Dict[str, Any] = Field(
+        description="Full copy of the JobSpec used to submit this job"
+    )
+
+    seeds: Dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Random seeds keyed by name, e.g. "
+            "{'global': 42, 'torch': 42, 'numpy': 42}. "
+            "Pass these in job_spec.metadata.seeds when submitting."
+        ),
+    )
+
+    runtime_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Python version, PyTorch version, CUDA, platform info",
+    )
+
+    extra_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Any additional context the submitter wants to attach",
+    )
+ 
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat(),
+        }
+ 
+ 
+class ExperimentCompareRequest(BaseModel):
+    """Request body for POST /api/experiments/compare."""
+    run_ids: List[str] = Field(
+        min_length=2,
+        description="List of run_ids to compare (minimum 2)",
+    )
+ 
+ 
+class ExperimentCompareResponse(BaseModel):
+    """Response for POST /api/experiments/compare."""
+    compared_runs: int = Field(description="Number of runs found and compared")
+    missing_runs: List[str] = Field(description="run_ids that were not found in the store")
+    records: List[Dict[str, Any]] = Field(description="Full experiment records")
+    summary: Dict[str, Any] = Field(
+        description=(
+            "High-level diff: same_git_commit, seeds_identical, "
+            "torch_versions, etc."
+        )
+    )

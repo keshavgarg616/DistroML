@@ -1,4 +1,5 @@
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from typing import List
 from datetime import datetime
@@ -8,6 +9,7 @@ from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconne
 
 from .coordinator import Coordinator, CoordinatorConfig
 from .websocket_manager import ConnectionManager
+from .experiments import ExperimentStore
 from .models import (
     JobSpec,
     JobStatusResponse,
@@ -16,6 +18,9 @@ from .models import (
     WorkerRegistration,
     WorkerInfo,
     HeartbeatPayload,
+    ExperimentMetadata,
+    ExperimentCompareRequest,
+    ExperimentCompareResponse,
 )
 from ..common import JobNotFoundError, WorkerNotFoundError, InvalidStateTransitionError
 
@@ -23,18 +28,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 coordinator: Coordinator = None
 ws_manager: ConnectionManager = None
+experiment_store: ExperimentStore = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    global coordinator, ws_manager
+    global coordinator, ws_manager, experiment_store
 
     config = CoordinatorConfig()
 
     # Initialize WebSocket manager first
     ws_manager = ConnectionManager()
     logger.info("WebSocket manager initialized")
+    
+    
+    
+    experiment_store = ExperimentStore(persist_path="./experiments/metadata.json")
+    logger.info("Experiment store initialized")
 
     # Initialize coordinator with WebSocket manager for state broadcasting
     logger.info("Initializing DistroML Coordinator...")
@@ -63,8 +74,19 @@ app = FastAPI(
 )
 async def submit_job(job_spec: JobSpec):
     try:
+        if "run_id" not in job_spec.metadata:
+            job_spec.metadata["run_id"] = str(uuid.uuid4())
+        run_id = job_spec.metadata["run_id"]
+ 
         job_id = await coordinator.submit_job(job_spec)
-        return {"job_id": job_id, "status": "QUEUED"}
+        experiment_store.record(
+            job_id=job_id,
+            run_id=run_id,
+            job_spec=job_spec.model_dump(),
+        )
+ 
+        return {"job_id": job_id, "run_id": run_id, "status": "QUEUED"}
+ 
     except Exception as e:
         logger.error(f"Failed to submit job: {e}")
         raise HTTPException(
@@ -192,6 +214,86 @@ async def receive_metrics(job_id: str, metrics: dict):
             detail=f"Failed to process metrics: {str(e)}"
         )
 
+@app.get(
+    "/api/experiments",
+    response_model=List[dict],
+    tags=["Experiments"],
+    summary="List all recorded experiment runs",
+)
+async def list_experiments():
+    """
+    Return all experiment records, newest first.
+ 
+    Each record includes the JobSpec, git commit hash, seeds, and runtime
+    config captured at job submission time.
+    """
+    return experiment_store.list_all()
+ 
+ 
+@app.get(
+    "/api/experiments/{run_id}",
+    response_model=dict,
+    tags=["Experiments"],
+    summary="Get experiment metadata for a specific run",
+)
+async def get_experiment(run_id: str):
+    """
+    Retrieve the full experiment record for a run_id.
+ 
+    The run_id is returned by POST /api/jobs alongside the job_id.
+    """
+    record = experiment_store.get_by_run_id(run_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No experiment record found for run_id={run_id}",
+        )
+    return record
+ 
+ 
+@app.get(
+    "/api/experiments/by-job/{job_id}",
+    response_model=dict,
+    tags=["Experiments"],
+    summary="Get experiment metadata by job ID",
+)
+async def get_experiment_by_job(job_id: str):
+    """
+    Retrieve the experiment record for a job_id.
+ 
+    Convenience endpoint so callers don't need to store the run_id separately.
+    """
+    record = experiment_store.get_by_job_id(job_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No experiment record found for job_id={job_id}",
+        )
+    return record
+ 
+ 
+@app.post(
+    "/api/experiments/compare",
+    response_model=ExperimentCompareResponse,
+    tags=["Experiments"],
+    summary="Compare metadata across two or more runs",
+)
+async def compare_experiments(request: ExperimentCompareRequest):
+    """
+    Side-by-side comparison of two or more experiment runs.
+ 
+    Pass a list of run_ids (minimum 2). The response includes:
+    - Full records for each run
+    - A summary showing whether git commits, seeds, and torch versions match
+    """
+    if len(request.run_ids) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least 2 run_ids are required for comparison",
+        )
+ 
+    result = experiment_store.compare(request.run_ids)
+    return ExperimentCompareResponse(**result)
 
 @app.websocket("/ws/jobs/{job_id}/stream")
 async def websocket_stream(websocket: WebSocket, job_id: str):
@@ -199,9 +301,7 @@ async def websocket_stream(websocket: WebSocket, job_id: str):
     await ws_manager.connect(websocket, job_id)
 
     try:
-        # Keep connection alive and listen for messages from workers/clients
         while True:
-            # Wait for messages (metrics from workers, commands from clients)
             try:
                 data = await websocket.receive_json()
 
@@ -209,14 +309,12 @@ async def websocket_stream(websocket: WebSocket, job_id: str):
                 message_type = data.get("type")
 
                 if message_type == "worker_register":
-                    # Worker identifying itself for shutdown commands
                     worker_id = data.get("worker_id")
                     if worker_id:
                         await ws_manager.register_worker_connection(worker_id, websocket)
                         logger.info(f"Worker {worker_id} registered its WebSocket connection")
 
                 elif message_type == "metrics":
-                    # Worker sending metrics - broadcast to all watchers
                     logger.debug(f"Received metrics via WebSocket for job {job_id}, step={data.get('data', {}).get('step')}")
                     try:
                         await ws_manager.broadcast_metrics(job_id, data.get("data", {}))
@@ -224,12 +322,10 @@ async def websocket_stream(websocket: WebSocket, job_id: str):
                         logger.error(f"Failed to broadcast metrics: {e}", exc_info=True)
 
                 elif message_type == "log":
-                    # Worker sending log - broadcast to all watchers
                     logger.debug(f"Received log via WebSocket for job {job_id}")
                     await ws_manager.broadcast_log(job_id, data.get("data", {}))
 
                 elif data.get("command") == "ping":
-                    # Client ping command - respond with pong
                     await ws_manager.send_personal_message(
                         {"type": "pong", "timestamp": datetime.now().isoformat()},
                         websocket
