@@ -60,6 +60,7 @@ class WorkerConfig:
     heartbeat_interval: int = 5  # seconds
     metrics_interval: int = 10  # seconds
     checkpoint_dir: str = "./checkpoints"
+    deterministic: bool = False
 
 
 @dataclass
@@ -689,6 +690,7 @@ def main():
     parser.add_argument(
         "--checkpoint-dir", type=str, default="./checkpoints", help="Checkpoint directory"
     )
+    parser.add_argument("--deterministic", type=bool, default=False, help="Deterministic mode flag")
 
     args = parser.parse_args()
 
@@ -703,6 +705,7 @@ def main():
         run_id=args.run_id,
         backend=args.backend,
         checkpoint_dir=args.checkpoint_dir,
+        deterministic=args.deterministic,
     )
 
     # Create and run worker
