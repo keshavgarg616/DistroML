@@ -147,7 +147,7 @@ def main():
         help="Coordinator API URL",
     )
     parser.add_argument("--steps", type=int, default=100, help="Total training steps")
-    parser.add_argument("--deterministic", type=bool, default=False, help="Deterministic Mode flag")
+    parser.add_argument("--deterministic", action='store_true', default=False, help="Deterministic Mode flag")
 
     args = parser.parse_args()
 

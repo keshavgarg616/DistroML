@@ -690,7 +690,7 @@ def main():
     parser.add_argument(
         "--checkpoint-dir", type=str, default="./checkpoints", help="Checkpoint directory"
     )
-    parser.add_argument("--deterministic", type=bool, default=False, help="Deterministic mode flag")
+    parser.add_argument("--deterministic", action='store_true', default=False, help="Deterministic mode flag")
 
     args = parser.parse_args()
 
