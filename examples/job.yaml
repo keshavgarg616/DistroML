@@ -1,0 +1,10 @@
+name: example-training-job
+world_size: 2
+backend: gloo
+coordinator_url: http://localhost:8000
+total_steps: 100
+metadata:
+  seeds:
+    global: 42
+    torch: 42
+    numpy: 42
