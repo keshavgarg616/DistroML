@@ -20,6 +20,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import random
+import numpy
+import json
 
 from .models import (
     WorkerResources,
@@ -524,12 +527,71 @@ class Coordinator:
     async def submit_job(self, job_spec: JobSpec) -> str:
         job_id = str(uuid.uuid4())
 
+        run_id = (
+            job_spec.metadata.get("run_id")
+            if job_spec.metadata and "run_id" in job_spec.metadata
+            else str(uuid.uuid4())
+        )
+
+        deterministic = getattr(job_spec, "deterministic", False)
+
+        # Global seed (deterministic OR random)
+        if job_spec.metadata and "seed" in job_spec.metadata:
+            global_seed = job_spec.metadata["seed"]
+        elif deterministic:
+            # deterministic run MUST be reproducible
+            global_seed = 42  # or config-fixed seed
+        else:
+            global_seed = random.randint(0, 10_000)
+
+        world_size = job_spec.world_size
+
+        # Per-worker seeds (stable + reproducible)
+        worker_seeds = {
+            str(rank): global_seed + rank
+            for rank in range(world_size)
+        }
+
+        experiment_metadata = {
+            "job_id": job_id,
+            "run_id": run_id,
+            "deterministic": deterministic,
+            "global_seed": global_seed,
+            "world_size": world_size,
+            "worker_seeds": worker_seeds,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        metadata_dir = os.path.join("./checkpoints", run_id)
+        metadata_path = os.path.join(metadata_dir, "experiment_metadata.json")
+        if os.path.exists(metadata_dir):
+            with open(metadata_path, "r") as f:
+                experiment_metadata = json.load(f)
+                global_seed = experiment_metadata["global_seed"]
+                worker_seeds = experiment_metadata["worker_seeds"]
+                if job_spec.world_size != experiment_metadata["world_size"]:
+                    raise ValueError(f"World size mismatch: {job_spec.world_size} != {experiment_metadata['world_size']}")
+                elif job_spec.deterministic != experiment_metadata["deterministic"]:
+                    raise ValueError(f"Deterministic mismatch: {job_spec.deterministic} != {experiment_metadata['deterministic']}")
+        else:
+            os.makedirs(metadata_dir, exist_ok=True)
+
+            with open(metadata_path, "w") as f:
+                json.dump(experiment_metadata, f, indent=2)
+
+            logger.info(f"Experiment metadata created at {metadata_path}")
+        deterministic = experiment_metadata["deterministic"]
+
         merged_meta: Dict[str, Any] = dict(job_spec.metadata or {})
-        if "run_id" not in merged_meta:
-            merged_meta["run_id"] = str(uuid.uuid4())
-        merged_meta.setdefault("world_size", job_spec.world_size)
-        merged_meta.setdefault("total_steps", 100)
-        merged_meta.setdefault("checkpoint_dir", "./checkpoints")
+
+        merged_meta.update({
+            "run_id": run_id,
+            "seed": global_seed,
+            "deterministic": deterministic,
+            "experiment_metadata_path": metadata_path,
+            "world_size": job_spec.world_size,
+            "total_steps": 100,
+            "checkpoint_dir": "./checkpoints",
+        })
 
         job_info = JobInfo(
             id=job_id,
@@ -847,6 +909,8 @@ class Coordinator:
                 "--checkpoint-dir",
                 str(checkpoint_dir),
             ]
+            if bool(meta.get("deterministic", False)):
+                cmd.append("--deterministic")
 
             subprocess.Popen(cmd, cwd=root, env=env)
 

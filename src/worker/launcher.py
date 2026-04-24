@@ -56,9 +56,9 @@ class WorkerLauncher:
                 backend,
                 "--total-steps",
                 str(total_steps),
-                "--deterministic",
-                bool(deterministic)
             ]
+            if deterministic:
+                cmd.append("--deterministic")
 
             print(f"Starting worker {rank}...")
 

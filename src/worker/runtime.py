@@ -112,6 +112,7 @@ class WorkerRuntime:
         # WebSocket streaming thread for real-time metrics/logs
         self.ws_streamer = None
         self._enable_websocket = True  # Can be disabled for testing/fallback
+        self.metadata=None
 
         logger.info(
             f"Worker initialized: id={config.worker_id}, "
@@ -126,8 +127,8 @@ class WorkerRuntime:
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
 
     def set_deterministic_seeds(self):
-        seeds = {}  # you'll improve this later
-        base_seed = seeds.get("global", 42)
+        self.load_experiment_metadata()
+        base_seed = self.metadata["global_seed"]
 
         # Important: per-worker variation
         seed = base_seed + self.config.rank
@@ -141,6 +142,21 @@ class WorkerRuntime:
         torch.backends.cudnn.benchmark = False
 
         logger.info(f"Deterministic seeds set: {seed}")
+
+    def load_experiment_metadata(self):
+        path = f"./{self.config.checkpoint_dir}/{self.config.run_id}/experiment_metadata.json"
+        timeout_seconds = 30
+        start_time = time.time()
+
+        while not os.path.exists(path):
+            if time.time() - start_time > timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out waiting for experiment metadata after {timeout_seconds}s: {path}"
+                )
+            time.sleep(0.1)
+
+        with open(path) as f:
+            self.metadata = json.load(f)
 
     def configure_failure_injection(
         self,
@@ -646,6 +662,13 @@ class WorkerRuntime:
 
         self.current_epoch = checkpoint["epoch"]
         restored_step = checkpoint["step"]
+        python_rng_state = checkpoint.get("python_rng_state")
+        if python_rng_state is not None:
+            random.setstate(python_rng_state)
+
+        numpy_rng_state = checkpoint.get("numpy_rng_state")
+        if numpy_rng_state is not None:
+            np.random.set_state(numpy_rng_state)
 
         logger.info(
             f"Checkpoint restored successfully from step {restored_step}, "
@@ -679,6 +702,8 @@ class WorkerRuntime:
             "optimizer_state": self.optimizer.state_dict(),
             "rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
         }
 
         torch.save(state, checkpoint_path)
