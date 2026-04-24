@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
 import json
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,7 @@ class WorkerConfig:
     heartbeat_interval: int = 5  # seconds
     metrics_interval: int = 10  # seconds
     checkpoint_dir: str = "./checkpoints"
+    deterministic: bool = False
 
 
 @dataclass
@@ -105,18 +107,56 @@ class WorkerRuntime:
         self.drop_heartbeat_rate = 0.0
 
         # Initialize dummy model/optimizer for checkpointing
-        self.model = torch.nn.Linear(10, 1)
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
-
+        self.model = None
+        self.optimizer = None
         # WebSocket streaming thread for real-time metrics/logs
         self.ws_streamer = None
         self._enable_websocket = True  # Can be disabled for testing/fallback
+        self.metadata=None
 
         logger.info(
             f"Worker initialized: id={config.worker_id}, "
             f"rank={config.rank}/{config.world_size}, "
             f"backend={config.backend}"
         )
+    def initialize_training_components(self):
+        if self.config.deterministic:
+            self.set_deterministic_seeds()
+
+        self.model = torch.nn.Linear(10, 1)
+        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+
+    def set_deterministic_seeds(self):
+        self.load_experiment_metadata()
+        base_seed = self.metadata["global_seed"]
+
+        # Important: per-worker variation
+        seed = base_seed + self.config.rank
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        logger.info(f"Deterministic seeds set: {seed}")
+
+    def load_experiment_metadata(self):
+        path = f"./{self.config.checkpoint_dir}/{self.config.run_id}/experiment_metadata.json"
+        timeout_seconds = 30
+        start_time = time.time()
+
+        while not os.path.exists(path):
+            if time.time() - start_time > timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out waiting for experiment metadata after {timeout_seconds}s: {path}"
+                )
+            time.sleep(0.1)
+
+        with open(path) as f:
+            self.metadata = json.load(f)
 
     def configure_failure_injection(
         self,
@@ -622,6 +662,13 @@ class WorkerRuntime:
 
         self.current_epoch = checkpoint["epoch"]
         restored_step = checkpoint["step"]
+        python_rng_state = checkpoint.get("python_rng_state")
+        if python_rng_state is not None:
+            random.setstate(python_rng_state)
+
+        numpy_rng_state = checkpoint.get("numpy_rng_state")
+        if numpy_rng_state is not None:
+            np.random.set_state(numpy_rng_state)
 
         logger.info(
             f"Checkpoint restored successfully from step {restored_step}, "
@@ -655,6 +702,8 @@ class WorkerRuntime:
             "optimizer_state": self.optimizer.state_dict(),
             "rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
         }
 
         torch.save(state, checkpoint_path)
@@ -689,6 +738,7 @@ def main():
     parser.add_argument(
         "--checkpoint-dir", type=str, default="./checkpoints", help="Checkpoint directory"
     )
+    parser.add_argument("--deterministic", action='store_true', default=False, help="Deterministic mode flag")
 
     args = parser.parse_args()
 
@@ -703,6 +753,7 @@ def main():
         run_id=args.run_id,
         backend=args.backend,
         checkpoint_dir=args.checkpoint_dir,
+        deterministic=args.deterministic,
     )
 
     # Create and run worker
@@ -720,14 +771,21 @@ def main():
         # Step 3: Check for checkpoint and restore if found
         start_step = 0
         checkpoint_info = worker.find_latest_checkpoint()
+        job_metadata = {}
 
         if checkpoint_info:
+            worker.initialize_training_components()
             checkpoint_dir, manifest = checkpoint_info
             logger.info(f"Found checkpoint at step {manifest['step']}, restoring...")
             start_step = worker.restore_checkpoint(checkpoint_dir, manifest)
             logger.info(f"Restored from checkpoint, resuming from step {start_step}")
+        elif worker.config.deterministic:
+            worker.set_deterministic_seeds()
+            worker.initialize_training_components()
+            logger.info("No checkpoint found, setting deterministic seeds...")
         else:
-            logger.info("No checkpoint found, starting fresh")
+            worker.initialize_training_components()
+            logger.info("No checkpoint found, starting fresh...")
 
         # Step 4: Initialize distributed training
         logger.info("Initializing distributed training...")

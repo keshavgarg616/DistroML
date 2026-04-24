@@ -25,6 +25,7 @@ class WorkerLauncher:
         backend: str = "gloo",
         coordinator_url: str = "http://localhost:8000",
         total_steps: int = 100,
+        deterministic: bool = False,
     ):
         """Launch multiple worker processes"""
 
@@ -56,6 +57,8 @@ class WorkerLauncher:
                 "--total-steps",
                 str(total_steps),
             ]
+            if deterministic:
+                cmd.append("--deterministic")
 
             print(f"Starting worker {rank}...")
 
@@ -144,6 +147,7 @@ def main():
         help="Coordinator API URL",
     )
     parser.add_argument("--steps", type=int, default=100, help="Total training steps")
+    parser.add_argument("--deterministic", action='store_true', default=False, help="Deterministic Mode flag")
 
     args = parser.parse_args()
 
@@ -155,6 +159,7 @@ def main():
             backend=args.backend,
             coordinator_url=args.coordinator_url,
             total_steps=args.steps,
+            deterministic=args.deterministic,
         )
         launcher.monitor()
     except Exception as e:
