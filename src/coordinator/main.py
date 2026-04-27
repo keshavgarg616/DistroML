@@ -236,6 +236,7 @@ async def list_experiments():
     tags=["Experiments"],
     summary="Get experiment metadata for a specific run",
 )
+
 async def get_experiment(run_id: str):
     """
     Retrieve the full experiment record for a run_id.
@@ -249,6 +250,56 @@ async def get_experiment(run_id: str):
             detail=f"No experiment record found for run_id={run_id}",
         )
     return record
+
+@app.post(
+    "/api/experiments/compare",
+    response_model=ExperimentCompareResponse,
+    tags=["Experiments"],
+    summary="Compare experiment runs side-by-side",
+)
+async def compare_experiments(request: ExperimentCompareRequest):
+    try:
+        result = experiment_store.compare(request.run_ids)
+
+        for record in result.get("records", []):
+            job_id = record.get("job_id")
+
+            # Default values if metrics are unavailable
+            record["final_loss"] = None
+            record["best_loss"] = None
+            record["steps"] = None
+            record["avg_throughput"] = None
+            record["runtime_seconds"] = None
+
+            # Pull training metrics from coordinator if available
+            if job_id:
+                metrics = await coordinator.get_job_metrics(job_id)
+                run_summary = metrics.get("run_summary", {})
+
+                record["final_loss"] = run_summary.get("latest_loss")
+                record["best_loss"] = run_summary.get("best_loss")
+                record["steps"] = run_summary.get("latest_step")
+                record["avg_throughput"] = run_summary.get("avg_throughput")
+
+            # Compute runtime from recorded_at if completed time is unavailable
+            recorded_at = record.get("recorded_at")
+            if recorded_at:
+                try:
+                    start = datetime.fromisoformat(recorded_at)
+                    record["runtime_seconds"] = (
+                        datetime.utcnow() - start
+                    ).total_seconds()
+                except Exception:
+                    record["runtime_seconds"] = None
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to compare experiments: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
  
  
 @app.get(
