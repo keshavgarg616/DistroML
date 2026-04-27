@@ -1142,6 +1142,25 @@ class Coordinator:
         # commit back
         job_store["run_summary"] = run_summary
 
+
+    async def get_job_metrics(self, job_id: str) -> Dict[str, Any]:
+        """
+        Return aggregated metrics for a job.
+        Used by experiment comparison to include final loss, steps, and throughput.
+        """
+        return self._metrics_store.get(
+            job_id,
+            {
+                "steps": {},
+                "run_summary": {
+                    "latest_step": None,
+                    "latest_loss": None,
+                    "best_loss": None,
+                    "avg_throughput": None,
+                },
+            },
+        )
+
     def _on_job_state_transition(
         self, job_id: str, from_state: str, to_state: str
     ) -> None:
